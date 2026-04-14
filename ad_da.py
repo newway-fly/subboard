@@ -6,6 +6,7 @@ Unified AD/DA Module with Circular DMA Dither and Arm Topology Control.
 - Supports P, N, and PN Arm configurations.
 - Calculates 800Hz Sine wave array in advance without outputting.
 - Starts/Stops physical Dither only when instructed by the Locking engine.
+- Optimized for Mode B and Noise Analysis
 """
 
 import pyb
@@ -189,15 +190,73 @@ class AD_DA:
             if self.dacs.get("DAC_Parm"): self.dacs["DAC_Parm"].write(self._dac_shadow["DAC_Parm"])
             if self.dacs.get("DAC_Narm"): self.dacs["DAC_Narm"].write(self._dac_shadow["DAC_Narm"])
 
-    def read_adc_timed_multi(self, adc_name, buf, timer_id=8, fs=19200):
-        """Hardware-timed synchronous ADC multi-read."""
+    # def read_adc_timed_multi(self, adc_name, buf, timer_id=8, fs=19200):
+    #     """Hardware-timed synchronous ADC multi-read."""
+    #     adc = self.get_adc_object(adc_name)
+    #     if adc:
+    #         try:
+    #             tim_adc = pyb.Timer(timer_id, freq=fs)
+    #             pyb.ADC.read_timed_multi((adc,), (buf,), tim_adc)
+    #         except Exception as e:
+    #             log(INFO, f"ADC Multi-read failed: {e}")
+
+
+    def read_adc_timed_multi(self, adc_name, buf, timer_id=7, fs=19200):
+        """
+        Hardware-timed synchronous ADC multi-read. 
+        Populates the float array directly without TaskQueue overhead.
+        [BugFix] Migrated from Timer 8 to Timer 7 to prevent collision with sweep.py
+        """
         adc = self.get_adc_object(adc_name)
         if adc:
             try:
+                # 使用 Timer 7 作为 ADC 的高频纯净触发源
                 tim_adc = pyb.Timer(timer_id, freq=fs)
+                # Non-blocking trigger. Fills 'buf' in the background via DMA/IRQ.
                 pyb.ADC.read_timed_multi((adc,), (buf,), tim_adc)
             except Exception as e:
-                log(INFO, f"ADC Multi-read failed: {e}")
+                log(INFO, f"Hardware timed multi-read failed for {adc_name}:", e)
+
+
+    # =================================================
+    # [NEW] Noise Analysis: Capture 1440*3 Points
+    # =================================================
+    def capture_noise_task(self, adc_name, source):
+        """
+        Captures 4320 samples (1440 * 3) of the ADC DC voltage for noise analysis.
+        Uses Timer 7 for high-precision hardware-timed sampling.
+        """
+        # Allocate 4320 float array (approx 17KB)
+        noise_buf = array('f', [0.0] * 4320)
+        
+        log(INFO, f"Starting Noise Capture on {adc_name} (4320 points)...")
+        
+        # Trigger hardware sampling @ 19200Hz using Timer 7
+        self.read_adc_timed_multi(adc_name, noise_buf, timer_id=7, fs=19200)
+        
+        # Wait for sampling to complete (~225ms for 4320 pts @ 19.2kHz + safety)
+        pyb.delay(250)
+        
+        # Dispatch to the export task to prevent blocking the state machine's logic flow
+        self._export_noise_data(noise_buf, source)
+
+    def _export_noise_data(self, buf, source):
+        """
+        Exports raw captured data to UART/USB in chunks to avoid TX buffer congestion.
+        """
+        self.handler._write_response("NOISE_DATA_START\n", source)
+        
+        for i in range(len(buf)):
+            # Transmit each value with 4 decimal precision
+            self.handler._write_response(f"{buf[i]:.4f}\n", source)
+            
+            # Flow control: Pause every 50 points to allow UART hardware FIFO to drain
+            if i % 50 == 0:
+                pyb.delay(2)
+                
+        self.handler._write_response("NOISE_DATA_END\n", source)
+        log(INFO, "Noise data export complete.")
+
 
     # =================================================
     # Legacy TaskQueue Wrappers (Unchanged)

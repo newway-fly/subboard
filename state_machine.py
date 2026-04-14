@@ -205,13 +205,40 @@ class StateMachine:
             elif head == "CALIB":
                 """
                 Command: CALIB <freq>
+                [Plan A] Automated Sequence: Dither ON -> Sample -> Dither OFF -> Calculate.
+                This ensures calibration is done with active physical perturbation.
                 """
                 freq = int(parts[1]) if len(parts) >= 2 else 800
                 if self.lock and self.ad_da:
-                    # Sync block to acquire baseline data for phase extraction
-                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_buf)
-                    pyb.delay(80) 
+                    log(INFO, f"Executing CALIB Plan A at {freq}Hz...")
+                    
+                    # 1. Start hardware dither output automatically
+                    self.ad_da.set_lock_dither(True)
+                    pyb.delay(20) # Hardware stabilization delay
+                    
+                    # 2. Trigger hardware-timed sampling for phase extraction (1440 points)
+                    # Note: uses self.lock.adc_buf (size 1440)
+                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_buf, timer_id=7)
+                    
+                    # 3. Wait for DMA transfer to finish (~75ms + safety)
+                    pyb.delay(85)
+                    
+                    # 4. Stop hardware dither immediately to return to DC state
+                    self.ad_da.set_lock_dither(False)
+                    
+                    # 5. Enqueue the phase calculation logic as a background task
                     self.task_queue.add_task(self.lock.calibrate_phase, freq)
+                return
+
+            elif head == "GET_ADC_NOISE":
+                """
+                Command: GET_ADC_NOISE [CH_NAME]
+                Captures 4320 points for raw noise evaluation.
+                """
+                ch_name = parts[1] if len(parts) >= 2 else "AC_Lock"
+                if self.ad_da:
+                    # Enqueue as a task to keep the state machine responsive
+                    self.task_queue.add_task(self.ad_da.capture_noise_task, ch_name, source)
                 return
             
 
