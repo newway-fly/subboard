@@ -1,36 +1,37 @@
+"""
+locking.py
+-------------------------
+High-Rigidity Locking Engine ported from ADuCM410 Mode B.
+[Subboard Version - Single Channel Autonomous FSM]
+- Evaluates 800Hz / 1600Hz dot products directly.
+- Triggers hardware Dither output strictly on start/stop.
+- PI controller relies on in-place DAC bias modifications.
+"""
+
 import pyb
 import math
 from array import array
 
-# --- Engineering Constants ---
 # 19.2kHz, 1440 points = 60 cycles @ 800Hz
 ADC_LEN = const(1440)
 
 class Lock_TimeMUX:
-    """
-    High-Rigidity Locking Engine ported from ADuCM410 Mode B.
-    Features: Orthogonal Dot-product extraction, 1f/2f Harmonic Analysis, 
-    and 3-stage PI Gain Scheduling.
-    """
     def __init__(self, ad_da, uart_master):
         self.ad_da = ad_da
         self.uart = uart_master
         self.running = False
         
-        # --- Critical Target Names (Must match config.py) ---
-        # The ADC channel name used for reading the Photodiode / Power Meter
+        # Internal configuration
         self.adc_target_name = "AC_Lock" 
-        
-        # --- Pre-allocated Memory Pools (Zero-GC during lock) ---
         self.adc_buf = array('f', [0.0] * ADC_LEN)
         self.ref_1f = array('f', [0.0] * ADC_LEN)
         self.ref_2f = array('f', [0.0] * ADC_LEN)
         
-        # --- Calibration Constants (Updated by CALIB command) ---
-        self.phase_1f = 68.52  # Default Sine phase offset
-        self.phase_2f = -5.2   # Default Cosine 2f phase offset
+        # Hardware calibration phase
+        self.phase_1f = 68.52  
+        self.phase_2f = -5.2   
         
-        # --- PI & Defense Parameters (Dict for easy tuning) ---
+        # Golden PI Parameters from C code
         self.params = {
             'errLpfAlpha': 0.85, 'i2Th': 0.00008, 'jumpErr': 0.01,
             'thFast': 0.004, 'thMid': 0.001, 'stepFast': 40,
@@ -38,18 +39,19 @@ class Lock_TimeMUX:
             'intLimit': 0.001, 'deadZone': 0.0001, 'stepMax': 80
         }
 
-        self.bias_p = [2048] * 6      # Current DAC codes for 6 channels
-        self.err_int = [0.0] * 6      # Integral accumulators
-        self.last_err = [0.0] * 6     # LPF history
-        self.targets = [1] * 6        # 1:MAX, 0:MIN, 2:QUAD
-        self.iters_rem = [0] * 6      # Remaining iteration counter
+        # Single Engine State
+        self.err_int = 0.0
+        self.last_err = 0.0
+        self.last_i2 = 0.0
+        self.target = 1        # 1:MAX, 0:MIN, 2:QUAD
+        self.iters_rem = 0
+        self.quad_slope = 1
         
-        self.active_ch = 0
         self.stage = "IDLE"
         self._generate_refs()
 
     def _generate_refs(self):
-        """Update internal reference tables with phase compensation."""
+        """Pre-compute mathematical NCO references."""
         w1 = 2 * math.pi * 800 / 19200
         w2 = 2 * math.pi * 1600 / 19200
         ph1 = math.radians(self.phase_1f)
@@ -58,26 +60,33 @@ class Lock_TimeMUX:
             self.ref_1f[i] = math.sin(w1 * i + ph1)
             self.ref_2f[i] = math.cos(w2 * i + ph2)
 
-    def start_lock(self, ch_idx, target, iters=100):
-        """API to trigger locking via UART/USB commands."""
-        if 0 <= ch_idx < 6:
-            self.targets[ch_idx] = target
-            self.iters_rem[ch_idx] = iters
-            self.running = True
-            self.active_ch = ch_idx
-            self.stage = "START"
-            self.uart.write(f"ACK: Locking CH{ch_idx} to TGT={target} for {iters} iters\n".encode('utf-8'))
+    def start_lock(self, target, iters=100):
+        """API to arm and trigger the physical locking engine."""
+        self.target = target
+        self.iters_rem = iters
+        self.err_int = 0.0
+        self.last_err = 0.0
+        self.last_i2 = 0.0
+        
+        # 1. Instruct AD/DA module to physically start emitting the Sine Wave
+        self.ad_da.set_lock_dither(True)
+        
+        self.running = True
+        self.stage = "START"
+        self.uart.write(f"ACK: Lock Started. TGT={target}, Iters={iters}\n".encode('utf-8'))
 
     def stop_lock(self):
-        """Force stop all locking activities."""
+        """Force stop all locking calculations and physical outputs."""
         self.running = False
         self.stage = "IDLE"
-        for i in range(6): 
-            self.iters_rem[i] = 0
+        self.iters_rem = 0
+        
+        # 2. Instruct AD/DA module to halt Dither and restore pure DC bias
+        self.ad_da.set_lock_dither(False)
         self.uart.write("ACK: Mode B Lock Stopped\n".encode('utf-8'))
 
     def calibrate_phase(self, base_freq=800):
-        """Single-point DFT to calibrate phase offsets (The 410 logic)."""
+        """Standard DFT Phase Extractor."""
         mean = sum(self.adc_buf) / ADC_LEN
         w1 = 2 * math.pi * base_freq / 19200
         w2 = 2 * math.pi * (base_freq * 2) / 19200
@@ -94,76 +103,90 @@ class Lock_TimeMUX:
         self.phase_1f = p1 if p1 <= 180 else p1 - 360
         self.phase_2f = math.degrees(math.atan2(q2f, i2f))
         
-        self._generate_refs() # Refresh mathematical reference arrays
+        self._generate_refs()
         self.uart.write(f"CALIB_DONE:1F={self.phase_1f:.2f},2F={self.phase_2f:.2f}\n".encode('utf-8'))
 
     def process(self):
-        """Non-blocking FSM - Must be called frequently by TaskQueue/Poll."""
+        """Non-blocking FSM heartbeat for TaskQueue execution."""
         if not self.running: return
 
         if self.stage == "START":
-            ch = self.active_ch
-            if self.iters_rem[ch] <= 0:
-                self.active_ch = (self.active_ch + 1) % 6
-                if all(it <= 0 for it in self.iters_rem): 
-                    self.running = False
+            if self.iters_rem <= 0:
+                self.stop_lock()
                 return
             
-            # Non-blocking trigger of the ADC capture (Specify the ADC name)
+            # Non-blocking trigger of the ADC capture
             self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_buf)
             self.start_ticks = pyb.millis()
             self.stage = "WAIT"
 
         elif self.stage == "WAIT":
-            # 1440 points at 19.2kHz = 75ms. We wait 80ms to be safe.
+            # 1440 points at 19.2kHz = 75ms. Wait 80ms for safety.
             if pyb.elapsed_millis(self.start_ticks) > 80: 
                 self.stage = "CALC"
 
         elif self.stage == "CALC":
-            ch = self.active_ch
             # A. DC Removal
             mean = sum(self.adc_buf) / ADC_LEN
             
             # B. Coherent Demodulation
-            i1, i2 = 0.0, 0.0
+            acc1, acc2, ref_energy = 0.0, 0.0, 0.0
             for i in range(ADC_LEN):
                 v = self.adc_buf[i] - mean
-                i1 += v * self.ref_1f[i]
-                i2 += v * self.ref_2f[i]
-            i1 /= (ADC_LEN/2)
-            i2 /= (ADC_LEN/2)
+                r1 = self.ref_1f[i]
+                r2 = self.ref_2f[i]
+                acc1 += v * r1
+                acc2 += v * r2
+                ref_energy += r1 * r1
+                
+            if ref_energy < 1e-6: ref_energy = 1.0
+            i1 = acc1 / ref_energy
+            i2 = acc2 / ref_energy
             
-            # C. Mode B Jump/Escape Logic & PI
-            err = 0.0
-            if self.targets[ch] == 1: # Target: MAX
-                err = i1 if i2 <= self.params['i2Th'] else -self.params['jumpErr']
-            elif self.targets[ch] == 0: # Target: MIN
-                err = -i1 if i2 >= -self.params['i2Th'] else self.params['jumpErr']
+            # C. Jump Escape Defense & Error Mapping
+            error_signal = 0.0
+            if self.target == 1: # MAX
+                error_signal = -self.params['jumpErr'] if i2 > self.params['i2Th'] else i1
+            elif self.target == 0: # MIN
+                error_signal = self.params['jumpErr'] if i2 < -self.params['i2Th'] else -i1
+            elif self.target == 2: # QUAD
+                error_signal = i2 if self.quad_slope > 0 else -i2
+                error_signal *= 1.5
+
+            # LPF Filter
+            alpha = self.params['errLpfAlpha']
+            smooth_err = alpha * error_signal + (1 - alpha) * self.last_err
+            self.last_err = smooth_err
+            self.last_i2 = alpha * i2 + (1 - alpha) * self.last_i2
             
-            # LPF Filter for Error
-            smooth_err = self.params['errLpfAlpha'] * err + (1 - self.params['errLpfAlpha']) * self.last_err[ch]
-            self.last_err[ch] = smooth_err
             abs_err = abs(smooth_err)
-            
-            # Gain Scheduling
             step = 0
+            
+            # Gain Scheduling & PI
             if abs_err > self.params['thFast']:
-                self.err_int[ch] = 0.0 # Reset Integral
+                self.err_int = 0.0
                 step = self.params['stepFast'] if smooth_err > 0 else -self.params['stepFast']
+            elif abs_err > self.params['thMid']:
+                self.err_int = 0.0
+                step = int(smooth_err * self.params['kMid'])
             else:
-                self.err_int[ch] = max(min(self.err_int[ch] + smooth_err, self.params['intLimit']), -self.params['intLimit'])
-                step = int(smooth_err * self.params['kFine'] + self.err_int[ch] * self.params['kInt'])
+                self.err_int += smooth_err
+                if self.err_int > self.params['intLimit']: self.err_int = self.params['intLimit']
+                if self.err_int < -self.params['intLimit']: self.err_int = -self.params['intLimit']
+                pi_step = int(smooth_err * self.params['kFine'] + self.err_int * self.params['kInt'])
+                step = 0 if abs_err <= self.params['deadZone'] else pi_step
+                    
+            # Hard Clamping
+            if step > self.params['stepMax']: step = self.params['stepMax']
+            if step < -self.params['stepMax']: step = -self.params['stepMax']
             
-            # D. Update Hardware (Seamless memory-based update)
-            self.bias_p[ch] = max(min(self.bias_p[ch] + step, 4095), 0)
+            # D. Write back to hardware AD_DA manager (updates mathematical relationship)
+            current_code = self.ad_da.current_main_code
+            new_code = max(min(current_code + step, 4095), 0)
+            self.ad_da.update_dac_bias(new_code)
             
-            # Look up DAC name from ad_da module safely based on channel index
-            dac_name = self.ad_da.dac_list[ch][1] if ch < len(self.ad_da.dac_list) else None
-            if dac_name:
-                self.ad_da.update_dac_bias(dac_name, self.bias_p[ch])
-            
-            self.iters_rem[ch] -= 1
-            if self.iters_rem[ch] % 5 == 0:
-                self.uart.write(f"LOCK:CH{ch},BIAS={self.bias_p[ch]},I1={i1:.5f},I2={i2:.5f}\n".encode('utf-8'))
+            self.iters_rem -= 1
+            if self.iters_rem % 5 == 0:
+                self.uart.write(f"LOCK: C={new_code}, I1={i1:.5f}, I2={i2:.5f}, Err={smooth_err:.5f}\n".encode('utf-8'))
             
             self.stage = "START"

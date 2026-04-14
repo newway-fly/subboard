@@ -151,67 +151,73 @@ class StateMachine:
                 self.task_queue.add_task(self.sweep.start_sweep, params, source)
                 return
 
-            # ========== LOCKING (Mode B 独家指令) ==========
+            # ========== MODE B SUBBOARD LOCKING PROTOCOL ==========
+            
+            elif head == "INIT_ARM":
+                """
+                Command: INIT_ARM <MODE> [V1] [V2]
+                Example: INIT_ARM PN 1.0 5.0
+                """
+                if len(parts) >= 2 and self.ad_da:
+                    mode = parts[1].upper()
+                    v1 = float(parts[2]) if len(parts) > 2 else None
+                    v2 = float(parts[3]) if len(parts) > 3 else None
+                    self.task_queue.add_task(self.ad_da.init_arm_config, mode, v1, v2)
+                    self._write_response(f"ACK: INIT_ARM {mode}\r\n", source)
+                return
+
+            elif head == "INIT_DITHER":
+                """
+                Command: INIT_DITHER <AMP>
+                Example: INIT_DITHER 30
+                """
+                if len(parts) >= 2 and self.ad_da:
+                    amp = int(parts[1])
+                    self.task_queue.add_task(self.ad_da.init_dither, amp)
+                    self._write_response(f"ACK: INIT_DITHER Amp={amp}\r\n", source)
+                return
+
+            elif head == "LOCK_B":
+                """
+                Command: LOCK_B START <TGT> <ITERS>  |  LOCK_B STOP  |  LOCK_B AMP <AMP>
+                Example: LOCK_B START MAX 200
+                """
+                if len(parts) >= 2 and self.lock:
+                    sub_cmd = parts[1].upper()
+                    
+                    if sub_cmd == "START" and len(parts) >= 3:
+                        tgt_map = {"MIN": 0, "MAX": 1, "QUAD": 2}
+                        target = tgt_map.get(parts[2].upper(), 1)
+                        iters = int(parts[3]) if len(parts) > 3 else 100
+                        self.task_queue.add_task(self.lock.start_lock, target, iters)
+                        self._write_response(f"ACK: LOCK_B START TGT={parts[2]}\r\n", source)
+                        
+                    elif sub_cmd == "STOP":
+                        self.task_queue.add_task(self.lock.stop_lock)
+                        
+                    elif sub_cmd == "AMP" and len(parts) >= 3:
+                        new_amp = int(parts[2])
+                        # Dynamically update the in-memory sine buffer without stopping hardware
+                        self.task_queue.add_task(self.ad_da.init_dither, new_amp)
+                        self._write_response(f"ACK: LOCK_B AMP = {new_amp}\r\n", source)
+                return
+
             elif head == "CALIB":
                 """
                 Command: CALIB <freq>
-                触发物理链路相位标定，解决 TIA 与运放带来的群延迟偏移。
                 """
                 freq = int(parts[1]) if len(parts) >= 2 else 800
                 if self.lock and self.ad_da:
-                    log(INFO, f"Starting CALIB Phase Extraction at {freq}Hz")
-                    # 1. 强制采集当前光功率 (阻塞模式保证数据实时)
+                    # Sync block to acquire baseline data for phase extraction
                     self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_buf)
-                    pyb.delay(80) # 1440点物理需要 75ms 缓冲
-                    
-                    # 2. 调用算法解算
+                    pyb.delay(80) 
                     self.task_queue.add_task(self.lock.calibrate_phase, freq)
                 return
+            
 
-            elif head == "LOCKMODE_B_CH":
-                """
-                Command: LOCKMODE_B_CH <CH> <TARGET> <ITERS>
-                Example: LOCKMODE_B_CH XI MAX 200
-                """
-                if len(parts) >= 3 and self.lock:
-                    ch_map = {"XI":0, "XQ":1, "XP":2, "YI":3, "YQ":4, "YP":5}
-                    tgt_map = {"MIN":0, "MAX":1, "QUAD":2, "OFF":3}
-                    
-                    ch_idx = ch_map.get(parts[1].upper(), -1)
-                    target = tgt_map.get(parts[2].upper(), 1)
-                    iters = int(parts[3]) if len(parts) > 3 else 100
-                    
-                    if ch_idx != -1:
-                        if target == 3: # OFF
-                            self.task_queue.add_task(self.lock.stop_lock)
-                        else:
-                            self.task_queue.add_task(self.lock.start_lock, ch_idx, target, iters)
-                    else:
-                        log(ERROR, f"Invalid Lock Channel: {parts[1]}")
-                return
-                
-            elif head == "LOCKMODE_B_STOP":
-                if self.lock:
-                    self.task_queue.add_task(self.lock.stop_lock)
-                return
-            elif head == "LOCKMODE_B_AMP":
-                """
-                Command: LOCKMODE_B_AMP <CH> <AMP_CODE>
-                Example: LOCKMODE_B_AMP XI 50
-                """
-                if len(parts) >= 3 and self.ad_da:
-                    ch_map = {"XI":0, "XQ":1, "XP":2, "YI":3, "YQ":4, "YP":5}
-                    ch_idx = ch_map.get(parts[1].upper(), -1)
-                    new_amp = int(parts[2])
-                    
-                    if ch_idx != -1:
-                        # 从底层 dac_list 中安全获取真实的 dac_name
-                        dac_name = self.ad_da.dac_list[ch_idx][1] if ch_idx < len(self.ad_da.dac_list) else None
-                        if dac_name:
-                            self.task_queue.add_task(self.ad_da.update_dither_amplitude, dac_name, new_amp)
-                    else:
-                        log(ERROR, f"Invalid Lock Channel for AMP update: {parts[1]}")
-                return
+
+
+
             else:
                 log(INFO, "Unknown command:", cmd_str)
             return

@@ -9,14 +9,20 @@ USB_READ_BUF = 128  # USB 读缓冲大小
 # SubBoard_ID从机ID配置
 SubBoard_ID = 1  # ID
 
-ID_to_loc_map = {
-    '1': {'P_arm': 'XI', 'N_arm': 'XQ'},
-    '2': {'P_arm': 'YI', 'N_arm': 'YQ'},
-    '3': {'P_arm': 'X', 'N_arm': 'Y'},
-}
+# ID_to_loc_map = {
+#     '1': {'P_arm': 'XI', 'N_arm': 'XQ'},
+#     '2': {'P_arm': 'YI', 'N_arm': 'YQ'},
+#     '3': {'P_arm': 'X', 'N_arm': 'Y'},
+# }
 
-P_arm_location = ID_to_loc_map[f"{SubBoard_ID}"]["P_arm"]
-N_arm_location = ID_to_loc_map[f"{SubBoard_ID}"]["N_arm"]
+# P_arm_location = ID_to_loc_map[f"{SubBoard_ID}"]["P_arm"]
+# N_arm_location = ID_to_loc_map[f"{SubBoard_ID}"]["N_arm"]
+
+# === Mode B Physics Constants ===
+Bias_Arm_Volt = 1.0       # Fixed DC voltage for the unused arm in Single-Arm mode (V)
+Bias_Amp_Volt = 5.0       # Default total voltage sum for PN Dual-Arm mode (V)
+MCU_ADDA_Vref = 3.382     # MCU Reference Voltage (V)
+
 
 uart_delay_ms = 0   #(SubBoard_ID-1)*5
 
@@ -65,9 +71,13 @@ ADC_SAMPLE_TIMES = 5            #重复采样次数
 ADC_SAMPLE_DELAY_US = 2000      #采样间隔us
 ADC_SAMPLE_TIMES_ForSweep = 5
 ADC_SAMPLE_DELAY_US_ForSweep = 200#1000
-MCU_ADDA_Vref = 3.382   #单位：V
-PSdriver_Amp = 2 #Amplification factor of the PS driver stage
-Volt_Bias_Amp = 5.0       #单位：V
+
+
+# MCU_ADDA_Vref = 3.382   #单位：V
+# PSdriver_Amp = 2 #Amplification factor of the PS driver stage
+# Volt_Bias_Amp = 5.0       #单位：V
+
+
 SWeep_ADC_list = [   
     ("DC_Power", "A0"),
     ("ADC_V_Parm", "C0"),
