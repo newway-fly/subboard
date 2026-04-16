@@ -22,7 +22,13 @@ class AD_DA:
         self.task_queue = task_queue
         self.handler = handler
         self.vref = MCU_ADDA_Vref
-        
+
+        # =================================================
+        # ADC 平均采样参数（可根据硬件调整）
+        # =================================================
+        self.ADC_SAMPLE_TIMES     = ADC_SAMPLE_TIMES      # 每次读取采样次数
+        self.ADC_SAMPLE_DELAY_US  = ADC_SAMPLE_DELAY_US   # 每次采样之间延时（微秒）
+
         # ================= ADC Initialization =================
         self.adcs = {}
         self.adc_list = []
@@ -62,7 +68,7 @@ class AD_DA:
         self.current_main_code = 2048       # Current active DC bias code
         
         # Dither parameters
-        self.dither_amp = 30                # Amplitude in DAC codes
+        self.dither_amp_mv = 30             # [UPDATED] Amplitude in mV (Peak-to-Peak)
         self.dither_active = False          # Physical output flag
         self.lcm_len = 48                   # 48 points for 800Hz @ 19.2kHz
         
@@ -95,26 +101,33 @@ class AD_DA:
         self.update_dac_bias(initial_code)
         log(INFO, f"ARM Configured: {self.arm_mode}, Initial Code: {initial_code}")
 
-    def init_dither(self, amp_code):
+    def init_dither(self, amp_mv):
         """
-        Sets the amplitude and pre-calculates the array. 
+        Sets the amplitude (in mV Vpp) and pre-calculates the array. 
         Does NOT start physical output.
         """
-        self.dither_amp = amp_code
+        self.dither_amp_mv = amp_mv
         self._recalc_sine_buffer()
-        log(INFO, f"Dither pre-calculated with Amp: {amp_code} Codes")
+        log(INFO, f"Dither pre-calculated with Vpp: {amp_mv} mV")
 
     def _recalc_sine_buffer(self):
         """
-        Calculates the actual output arrays based on arm mode and DC bias.
+        Calculates the actual output arrays based on arm mode, DC bias, and mV amplitude.
         """
         w = 2 * math.pi * 800 / 19200
         p_base = self._dac_shadow.get("DAC_Parm", 2048)
         n_base = self._dac_shadow.get("DAC_Narm", 2048)
-        amp = self.dither_amp
+        
+        # [UPDATED] Convert Vpp (mV) to single-sided DAC code amplitude
+        vref_mv = self.vref * 1000.0
+        # Vpp_code = (Vpp_mV / Vref_mV) * 4095
+        # Single-sided amplitude (Zero-to-Peak) = Vpp_code / 2.0
+        amp_code = (self.dither_amp_mv / vref_mv) * 4095.0 / 2.0
         
         for i in range(self.lcm_len):
-            wave = amp * math.sin(w * i)
+            # Calculate AC component using precise float amplitude
+            wave = amp_code * math.sin(w * i)
+            
             # Apply dither strictly based on arm topology
             if self.arm_mode == "P":
                 val_p = int(p_base + wave)
@@ -123,9 +136,7 @@ class AD_DA:
                 val_p = p_base
                 val_n = int(n_base + wave)
             elif self.arm_mode == "PN":
-                # In Push-Pull, usually Dither is applied anti-phase or to one arm.
-                # Here we apply it to Parm, and keep Narm steady, or you can invert it.
-                # Defaulting to apply only to P-arm for simplicity in PN mode as requested.
+                # Defaulting to apply only to P-arm for simplicity in PN mode
                 val_p = int(p_base + wave)
                 val_n = n_base
                 
@@ -190,22 +201,10 @@ class AD_DA:
             if self.dacs.get("DAC_Parm"): self.dacs["DAC_Parm"].write(self._dac_shadow["DAC_Parm"])
             if self.dacs.get("DAC_Narm"): self.dacs["DAC_Narm"].write(self._dac_shadow["DAC_Narm"])
 
-    # def read_adc_timed_multi(self, adc_name, buf, timer_id=8, fs=19200):
-    #     """Hardware-timed synchronous ADC multi-read."""
-    #     adc = self.get_adc_object(adc_name)
-    #     if adc:
-    #         try:
-    #             tim_adc = pyb.Timer(timer_id, freq=fs)
-    #             pyb.ADC.read_timed_multi((adc,), (buf,), tim_adc)
-    #         except Exception as e:
-    #             log(INFO, f"ADC Multi-read failed: {e}")
-
-
     def read_adc_timed_multi(self, adc_name, buf, timer_id=7, fs=19200):
         """
         Hardware-timed synchronous ADC multi-read. 
         Populates the float array directly without TaskQueue overhead.
-        [BugFix] Migrated from Timer 8 to Timer 7 to prevent collision with sweep.py
         """
         adc = self.get_adc_object(adc_name)
         if adc:
@@ -217,46 +216,58 @@ class AD_DA:
             except Exception as e:
                 log(INFO, f"Hardware timed multi-read failed for {adc_name}:", e)
 
-
-    # =================================================
-    # [NEW] Noise Analysis: Capture 1440*3 Points
+# =================================================
+    # [NEW] Noise Analysis: Capture 1440*3 Points (Optimized Burst & GC)
     # =================================================
     def capture_noise_task(self, adc_name, source):
         """
-        Captures 4320 samples (1440 * 3) of the ADC DC voltage for noise analysis.
-        Uses Timer 7 for high-precision hardware-timed sampling.
+        Captures 4320 samples for noise analysis using a memory-safe 'Burst & Stream' strategy.
+        Includes aggressive Garbage Collection (GC) to prevent string fragmentation during UART TX.
         """
-        # Allocate 4320 float array (approx 17KB)
-        noise_buf = array('f', [0.0] * 4320)
+        import gc  # 引入底层垃圾回收模块
         
-        log(INFO, f"Starting Noise Capture on {adc_name} (4320 points)...")
-        
-        # Trigger hardware sampling @ 19200Hz using Timer 7
-        self.read_adc_timed_multi(adc_name, noise_buf, timer_id=7, fs=19200)
-        
-        # Wait for sampling to complete (~225ms for 4320 pts @ 19.2kHz + safety)
-        pyb.delay(250)
-        
-        # Dispatch to the export task to prevent blocking the state machine's logic flow
-        self._export_noise_data(noise_buf, source)
-
-    def _export_noise_data(self, buf, source):
-        """
-        Exports raw captured data to UART/USB in chunks to avoid TX buffer congestion.
-        """
-        self.handler._write_response("NOISE_DATA_START\n", source)
-        
-        for i in range(len(buf)):
-            # Transmit each value with 4 decimal precision
-            self.handler._write_response(f"{buf[i]:.4f}\n", source)
+        try:
+            chunk_size = 1440
+            bursts = 3
             
-            # Flow control: Pause every 50 points to allow UART hardware FIFO to drain
-            if i % 50 == 0:
-                pyb.delay(2)
+            # [终极内存防线]：采用生成器推导式，避免 array * int 语法报错，同时避免 List 内存碎片
+            noise_buf = array('H', (0 for _ in range(chunk_size)))
+            
+            if self.handler:
+                self.handler._write_response(f"NOISE_DATA_START\r\n", source)
+            
+            for burst in range(bursts):
+                log(INFO, f"Noise burst {burst+1}/{bursts} on {adc_name}...")
                 
-        self.handler._write_response("NOISE_DATA_END\n", source)
-        log(INFO, "Noise data export complete.")
+                # 1. 触发底层硬件 DMA 采样 (19.2kHz)
+                self.read_adc_timed_multi(adc_name, noise_buf, timer_id=7, fs=19200)
+                
+                # 2. 1440点耗时约 75ms，给足 85ms 让底层 DMA 完成安全搬运
+                pyb.delay(85)
+                
+                # 3. 立即将这批 1440 个点换算为电压并吐出
+                for i in range(chunk_size):
+                    # 现场将 12-bit ADC 原始码值转换为浮点电压
+                    voltage = (noise_buf[i] / 4095.0) * self.vref
+                    
+                    if self.handler:
+                        self.handler._write_response(f"{voltage:.4f}\r\n", source)
+                    
+                    # 4. UART 防爆节流阀 & 内存清道夫
+                    if i % 50 == 0:
+                        pyb.delay(2)    # 让物理 UART FIFO 有时间把数据发出去
+                        gc.collect()    # 强制清理刚刚生成的 50 个临时字符串对象！(消灭 40 字节碎片)
 
+            if self.handler:
+                self.handler._write_response(f"NOISE_DATA_END\r\n", source)
+                log(INFO, "Noise data export complete.")
+                
+        except Exception as e:
+            log(INFO, f"ERROR in capture_noise_task: {e}")
+            if self.handler:
+                self.handler._write_response(f"ERROR: {e}\r\n", source)
+
+                
 
     # =================================================
     # Legacy TaskQueue Wrappers (Unchanged)
@@ -272,7 +283,8 @@ class AD_DA:
                 total += adc.read()
                 count += 1
                 pyb.udelay(self.ADC_SAMPLE_DELAY_US)
-        except Exception as e: return None
+        except Exception as e: 
+            return None
         return total // count if count else None
 
     def read_all_adc_task(self, source):
@@ -281,10 +293,12 @@ class AD_DA:
 
     def read_adc_task(self, ch, source):
         target = next((t for t in self.adc_list if t[0] == ch or t[1] == ch), None)
-        if not target: return
+        if not target: 
+            return
         idx, name, adc = target
         val = self._read_adc_avg(adc)
-        if self.handler: self.task_queue.add_task(self.handler.handle_adc_data, [(idx, name, val)], source)
+        if self.handler: 
+            self.task_queue.add_task(self.handler.handle_adc_data, [(idx, name, val)], source)
     
     def get_adc_object(self, ch):
         target = next((t for t in self.adc_list if t[0] == ch or t[1] == ch), None)

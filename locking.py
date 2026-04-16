@@ -6,6 +6,7 @@ High-Rigidity Locking Engine ported from ADuCM410 Mode B.
 - Evaluates 800Hz / 1600Hz dot products directly.
 - Triggers hardware Dither output strictly on start/stop.
 - PI controller relies on in-place DAC bias modifications.
+- [NEW] Dynamic Open/Closed Loop decoupling via update_dac_en.
 """
 
 import pyb
@@ -26,17 +27,26 @@ class Lock_TimeMUX:
         self.adc_buf = array('f', [0.0] * ADC_LEN)
         self.ref_1f = array('f', [0.0] * ADC_LEN)
         self.ref_2f = array('f', [0.0] * ADC_LEN)
-        
+  
+
         # Hardware calibration phase
         self.phase_1f = 68.52  
         self.phase_2f = -5.2   
         
         # Golden PI Parameters from C code
         self.params = {
-            'errLpfAlpha': 0.85, 'i2Th': 0.00008, 'jumpErr': 0.01,
-            'thFast': 0.004, 'thMid': 0.001, 'stepFast': 40,
-            'kMid': 4000.0, 'kFine': 3000.0, 'kInt': 1000.0,
-            'intLimit': 0.001, 'deadZone': 0.0001, 'stepMax': 80
+            'errLpfAlpha': 0.85, 
+            'i2Th': 0.0001, 
+            'jumpErr': 0.01,
+            'thFast': 0.004, 
+            'thMid': 0.001, 
+            'stepFast': 40,
+            'kMid': 4000.0, 
+            'kFine': 3000.0, 
+            'kInt': 1000.0,
+            'intLimit': 0.001, 
+            'deadZone': 0.0001, 
+            'stepMax': 80
         }
 
         # Single Engine State
@@ -46,6 +56,9 @@ class Lock_TimeMUX:
         self.target = 1        # 1:MAX, 0:MIN, 2:QUAD
         self.iters_rem = 0
         self.quad_slope = 1
+        
+        # [NEW] DAC Update Enable Flag (Closed Loop vs Open Loop)
+        self.update_dac_en = True
         
         self.stage = "IDLE"
         self._generate_refs()
@@ -85,6 +98,15 @@ class Lock_TimeMUX:
         self.ad_da.set_lock_dither(False)
         self.uart.write("ACK: Mode B Lock Stopped\n".encode('utf-8'))
 
+    def set_update_dac(self, enable):
+        """
+        [NEW] Dynamically enable or disable DAC feedback (Closed vs Open loop).
+        Clears integral windup immediately when disabling feedback.
+        """
+        self.update_dac_en = enable
+        if not enable:
+            self.err_int = 0.0
+
     def calibrate_phase(self, base_freq=800):
         """Standard DFT Phase Extractor."""
         mean = sum(self.adc_buf) / ADC_LEN
@@ -116,7 +138,7 @@ class Lock_TimeMUX:
                 return
             
             # Non-blocking trigger of the ADC capture
-            self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_buf)
+            self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_buf, timer_id=7)
             self.start_ticks = pyb.millis()
             self.stage = "WAIT"
 
@@ -162,31 +184,42 @@ class Lock_TimeMUX:
             abs_err = abs(smooth_err)
             step = 0
             
-            # Gain Scheduling & PI
-            if abs_err > self.params['thFast']:
-                self.err_int = 0.0
-                step = self.params['stepFast'] if smooth_err > 0 else -self.params['stepFast']
-            elif abs_err > self.params['thMid']:
-                self.err_int = 0.0
-                step = int(smooth_err * self.params['kMid'])
-            else:
-                self.err_int += smooth_err
-                if self.err_int > self.params['intLimit']: self.err_int = self.params['intLimit']
-                if self.err_int < -self.params['intLimit']: self.err_int = -self.params['intLimit']
-                pi_step = int(smooth_err * self.params['kFine'] + self.err_int * self.params['kInt'])
-                step = 0 if abs_err <= self.params['deadZone'] else pi_step
-                    
-            # Hard Clamping
-            if step > self.params['stepMax']: step = self.params['stepMax']
-            if step < -self.params['stepMax']: step = -self.params['stepMax']
-            
-            # D. Write back to hardware AD_DA manager (updates mathematical relationship)
             current_code = self.ad_da.current_main_code
-            new_code = max(min(current_code + step, 4095), 0)
-            self.ad_da.update_dac_bias(new_code)
+            new_code = current_code
             
+            # D. Conditional PI Execution & DAC Update
+            if self.update_dac_en:
+                # Gain Scheduling & PI
+                if abs_err > self.params['thFast']:
+                    self.err_int = 0.0
+                    step = self.params['stepFast'] if smooth_err > 0 else -self.params['stepFast']
+                elif abs_err > self.params['thMid']:
+                    self.err_int = 0.0
+                    step = int(smooth_err * self.params['kMid'])
+                else:
+                    self.err_int += smooth_err
+                    if self.err_int > self.params['intLimit']: self.err_int = self.params['intLimit']
+                    if self.err_int < -self.params['intLimit']: self.err_int = -self.params['intLimit']
+                    pi_step = int(smooth_err * self.params['kFine'] + self.err_int * self.params['kInt'])
+                    step = 0 if abs_err <= self.params['deadZone'] else pi_step
+                        
+                # Hard Clamping
+                if step > self.params['stepMax']: step = self.params['stepMax']
+                if step < -self.params['stepMax']: step = -self.params['stepMax']
+                
+                # Write back to hardware AD_DA manager (updates mathematical relationship)
+                new_code = max(min(current_code + step, 4095), 0)
+                self.ad_da.update_dac_bias(new_code)
+            else:
+                # Prevent integral windup while feedback is disabled
+                self.err_int = 0.0
+            
+            # E. Telemetry Log
             self.iters_rem -= 1
             if self.iters_rem % 5 == 0:
-                self.uart.write(f"LOCK: C={new_code}, I1={i1:.5f}, I2={i2:.5f}, Err={smooth_err:.5f}\n".encode('utf-8'))
+                log_str = f"LOCK: C={new_code}, I1={i1:.5f}, I2={i2:.5f}, Err={smooth_err:.5f}"
+                if not self.update_dac_en:
+                    log_str += ", UPDATE_DAC OFF"
+                self.uart.write((log_str + "\n").encode('utf-8'))
             
             self.stage = "START"

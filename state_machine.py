@@ -98,6 +98,7 @@ class StateMachine:
             parts = cmd_str.split()
             if not parts: return
             head = parts[0].upper()
+            
 
             # ========== ADC ==========
             if head == "ADC" and self.ad_da:
@@ -125,10 +126,12 @@ class StateMachine:
 
             # ========== GPIO ==========
             elif head == "GPIO" and self.gpio:
+
                 if len(parts) >= 3:
                     self.task_queue.add_task(self.gpio.set_pin_task, parts[1], parts[2].upper(), source)
                 elif len(parts) == 2:
                     self.task_queue.add_task(self.gpio.read_pin_task, parts[1], source)
+
                 elif len(parts) == 1:
                     self.task_queue.add_task(self.gpio.read_all_pins_task, source)
                 return
@@ -168,19 +171,19 @@ class StateMachine:
 
             elif head == "INIT_DITHER":
                 """
-                Command: INIT_DITHER <AMP>
-                Example: INIT_DITHER 30
+                Command: INIT_DITHER <AMP_mV>
+                Example: INIT_DITHER 30 (Sets Vpp to 30mV)
                 """
                 if len(parts) >= 2 and self.ad_da:
-                    amp = int(parts[1])
-                    self.task_queue.add_task(self.ad_da.init_dither, amp)
-                    self._write_response(f"ACK: INIT_DITHER Amp={amp}\r\n", source)
+                    amp_mv = int(parts[1])
+                    self.task_queue.add_task(self.ad_da.init_dither, amp_mv)
+                    self._write_response(f"ACK: INIT_DITHER Vpp={amp_mv}mV\r\n", source)
                 return
 
             elif head == "LOCK_B":
                 """
-                Command: LOCK_B START <TGT> <ITERS>  |  LOCK_B STOP  |  LOCK_B AMP <AMP>
-                Example: LOCK_B START MAX 200
+                Command: LOCK_B START <TGT> <ITERS> | LOCK_B STOP | LOCK_B AMP <AMP_mV> | LOCK_B UPDATE_DAC <ON/OFF>
+                Example: LOCK_B UPDATE_DAC OFF
                 """
                 if len(parts) >= 2 and self.lock:
                     sub_cmd = parts[1].upper()
@@ -196,10 +199,20 @@ class StateMachine:
                         self.task_queue.add_task(self.lock.stop_lock)
                         
                     elif sub_cmd == "AMP" and len(parts) >= 3:
-                        new_amp = int(parts[2])
+                        new_amp_mv = int(parts[2])
                         # Dynamically update the in-memory sine buffer without stopping hardware
-                        self.task_queue.add_task(self.ad_da.init_dither, new_amp)
-                        self._write_response(f"ACK: LOCK_B AMP = {new_amp}\r\n", source)
+                        self.task_queue.add_task(self.ad_da.init_dither, new_amp_mv)
+                        self._write_response(f"ACK: LOCK_B AMP = {new_amp_mv}mV\r\n", source)
+                        
+                    # [NEW] UPDATE_DAC Command Handling
+                    elif sub_cmd == "UPDATE_DAC" and len(parts) >= 3:
+                        en_str = parts[2].upper()
+                        if en_str == "ON":
+                            self.task_queue.add_task(self.lock.set_update_dac, True)
+                            self._write_response(f"ACK: LOCK_B UPDATE_DAC ON\r\n", source)
+                        elif en_str == "OFF":
+                            self.task_queue.add_task(self.lock.set_update_dac, False)
+                            self._write_response(f"ACK: LOCK_B UPDATE_DAC OFF\r\n", source)
                 return
 
             elif head == "CALIB":
@@ -230,21 +243,18 @@ class StateMachine:
                     self.task_queue.add_task(self.lock.calibrate_phase, freq)
                 return
 
-            elif head == "GET_ADC_NOISE":
+            elif head == "GET_PD_ADC_NOISE":
                 """
-                Command: GET_ADC_NOISE [CH_NAME]
+                Command: GET_PD_ADC_NOISE [CH_NAME]
                 Captures 4320 points for raw noise evaluation.
                 """
+                self._write_response(f"GET_PD_ADC_NOISE1\r\n", source)
                 ch_name = parts[1] if len(parts) >= 2 else "AC_Lock"
                 if self.ad_da:
                     # Enqueue as a task to keep the state machine responsive
+                    self._write_response(f"ch_name: {ch_name}\r\n", source)
                     self.task_queue.add_task(self.ad_da.capture_noise_task, ch_name, source)
                 return
-            
-
-
-
-
             else:
                 log(INFO, "Unknown command:", cmd_str)
             return

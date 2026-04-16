@@ -145,6 +145,7 @@ class GPIOControl:
             try:
                 value = self.pins[pin_name]["pin"].value()
                 result.append((pin_name, value, self.pins[pin_name]["mode"]))
+
             except Exception:
                 result.append((pin_name, None, "ERROR"))
         else:

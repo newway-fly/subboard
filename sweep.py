@@ -3,7 +3,7 @@
 # --------------------------------------------------
 
 import pyb,gc
-from config import MCU_ADDA_Vref, Volt_Bias_Amp
+from config import MCU_ADDA_Vref, Bias_Amp_Volt
 
 class Sweep:
     """
@@ -50,7 +50,7 @@ class Sweep:
 
         # 电压参数
         self.vref = MCU_ADDA_Vref
-        self.volt_bias_amp = Volt_Bias_Amp
+        self.Bias_Amp_Volt = Bias_Amp_Volt
 
         # ---------------- 游标 ----------------
         self.current = 0
@@ -91,13 +91,13 @@ class Sweep:
         # self.fixed_parm = params.get("fixed_arm", 620)
         # self.fixed_narm = params.get("fixed_arm", 620)
         # self.vref = params.get("vref", MCU_ADDA_Vref)
-        # self.volt_bias_amp = params.get("volt_bias_amp", Volt_Bias_Amp)
+        # self.Bias_Amp_Volt = params.get("Bias_Amp_Volt", Bias_Amp_Volt)
 
         self.fixed_parm = 620 if params.get("fixed_arm") is None else params["fixed_arm"]
         self.fixed_narm = 620 if params.get("fixed_arm") is None else params["fixed_arm"]
 
         self.vref = MCU_ADDA_Vref if params.get("vref") is None else params["vref"]
-        self.volt_bias_amp = Volt_Bias_Amp if params.get("volt_bias_amp") is None else params["volt_bias_amp"]
+        self.Bias_Amp_Volt = Bias_Amp_Volt if params.get("Bias_Amp_Volt") is None else params["Bias_Amp_Volt"]
 
 
         # -------- 初始化状态 --------
@@ -232,7 +232,7 @@ class Sweep:
                 self.ad_da.set_dac_task("DAC_Parm", dac_parm, None)
         elif self.mode == self.MODE_FORMULA:
             dac_parm = self.current
-            dac_narm = int( (self.volt_bias_amp - (dac_parm / 4096.0 * self.vref * 2))
+            dac_narm = int( (self.Bias_Amp_Volt - (dac_parm / 4096.0 * self.vref * 2))
                 / 2.0 / self.vref * 4096 )
             self.ad_da.set_dac_task("DAC_Parm", dac_parm, None)
             self.ad_da.set_dac_task("DAC_Narm", dac_narm, None)
@@ -256,7 +256,7 @@ class Sweep:
             else:# delay for ADC sampling
                 pyb.delay(int(self.delay*0.3))
             adc_v_parm = self.ad_da.read_adc_sync("ADC_V_Parm", True)
-            dac_narm = int( (self.volt_bias_amp - (adc_v_parm / 4096.0 * self.vref / 150.0 * 350)) 
+            dac_narm = int( (self.Bias_Amp_Volt - (adc_v_parm / 4096.0 * self.vref / 150.0 * 350)) 
                            / 2.0 / self.vref * 4096 )
             self.ad_da.set_dac_task("DAC_Narm", dac_narm, None)#"uart"
 
