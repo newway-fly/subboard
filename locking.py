@@ -6,7 +6,7 @@ High-Rigidity Locking Engine ported from ADuCM410 Mode B.
 - Evaluates 800Hz / 1600Hz dot products directly.
 - Triggers hardware Dither output strictly on start/stop.
 - PI controller relies on in-place DAC bias modifications.
-- [NEW] Dynamic Open/Closed Loop decoupling via update_dac_en.
+- [NEW] Uses MemoryView to share the static global_adc_pool natively.
 """
 
 import pyb
@@ -24,29 +24,25 @@ class Lock_TimeMUX:
         
         # Internal configuration
         self.adc_target_name = "AC_Lock" 
-        self.adc_buf = array('f', [0.0] * ADC_LEN)
+        
+        # [NEW] Zero-Allocation Memory Aliasing
+        # Maps a view exclusively to the first 1440 elements of the global memory pool.
+        # This allows locking and noise-capture to safely share exactly the same SRAM space.
+        self.adc_view = memoryview(self.ad_da.global_adc_pool)[0:ADC_LEN]
+        
         self.ref_1f = array('f', [0.0] * ADC_LEN)
         self.ref_2f = array('f', [0.0] * ADC_LEN)
-  
-
+        
         # Hardware calibration phase
         self.phase_1f = 68.52  
         self.phase_2f = -5.2   
         
         # Golden PI Parameters from C code
         self.params = {
-            'errLpfAlpha': 0.85, 
-            'i2Th': 0.0001, 
-            'jumpErr': 0.01,
-            'thFast': 0.004, 
-            'thMid': 0.001, 
-            'stepFast': 40,
-            'kMid': 4000.0, 
-            'kFine': 3000.0, 
-            'kInt': 1000.0,
-            'intLimit': 0.001, 
-            'deadZone': 0.0001, 
-            'stepMax': 80
+            'errLpfAlpha': 0.85, 'i2Th': 0.00008, 'jumpErr': 0.01,
+            'thFast': 0.004, 'thMid': 0.001, 'stepFast': 40,
+            'kMid': 4000.0, 'kFine': 3000.0, 'kInt': 1000.0,
+            'intLimit': 0.001, 'deadZone': 0.0001, 'stepMax': 80
         }
 
         # Single Engine State
@@ -57,7 +53,7 @@ class Lock_TimeMUX:
         self.iters_rem = 0
         self.quad_slope = 1
         
-        # [NEW] DAC Update Enable Flag (Closed Loop vs Open Loop)
+        # DAC Update Enable Flag (Closed Loop vs Open Loop)
         self.update_dac_en = True
         
         self.stage = "IDLE"
@@ -81,7 +77,7 @@ class Lock_TimeMUX:
         self.last_err = 0.0
         self.last_i2 = 0.0
         
-        # 1. Instruct AD/DA module to physically start emitting the Sine Wave
+        # Instruct AD/DA module to physically start emitting the Sine Wave
         self.ad_da.set_lock_dither(True)
         
         self.running = True
@@ -94,13 +90,13 @@ class Lock_TimeMUX:
         self.stage = "IDLE"
         self.iters_rem = 0
         
-        # 2. Instruct AD/DA module to halt Dither and restore pure DC bias
+        # Instruct AD/DA module to halt Dither and restore pure DC bias
         self.ad_da.set_lock_dither(False)
         self.uart.write("ACK: Mode B Lock Stopped\n".encode('utf-8'))
 
     def set_update_dac(self, enable):
         """
-        [NEW] Dynamically enable or disable DAC feedback (Closed vs Open loop).
+        Dynamically enable or disable DAC feedback (Closed vs Open loop).
         Clears integral windup immediately when disabling feedback.
         """
         self.update_dac_en = enable
@@ -108,14 +104,14 @@ class Lock_TimeMUX:
             self.err_int = 0.0
 
     def calibrate_phase(self, base_freq=800):
-        """Standard DFT Phase Extractor."""
-        mean = sum(self.adc_buf) / ADC_LEN
+        """Standard DFT Phase Extractor based on memoryview data."""
+        mean = sum(self.adc_view) / ADC_LEN
         w1 = 2 * math.pi * base_freq / 19200
         w2 = 2 * math.pi * (base_freq * 2) / 19200
         i1f, q1f, i2f, q2f = 0.0, 0.0, 0.0, 0.0
         
         for i in range(ADC_LEN):
-            v = self.adc_buf[i] - mean
+            v = self.adc_view[i] - mean
             i1f += v * math.cos(w1 * i)
             q1f += v * -math.sin(w1 * i)
             i2f += v * math.cos(w2 * i)
@@ -137,8 +133,8 @@ class Lock_TimeMUX:
                 self.stop_lock()
                 return
             
-            # Non-blocking trigger of the ADC capture
-            self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_buf, timer_id=7)
+            # Non-blocking trigger of the ADC capture targeting the shared memoryview
+            self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_view, timer_id=7)
             self.start_ticks = pyb.millis()
             self.stage = "WAIT"
 
@@ -148,13 +144,14 @@ class Lock_TimeMUX:
                 self.stage = "CALC"
 
         elif self.stage == "CALC":
-            # A. DC Removal
-            mean = sum(self.adc_buf) / ADC_LEN
+            # A. DC Removal (Compatible with unsigned short memoryview)
+            mean = sum(self.adc_view) / ADC_LEN
             
             # B. Coherent Demodulation
             acc1, acc2, ref_energy = 0.0, 0.0, 0.0
             for i in range(ADC_LEN):
-                v = self.adc_buf[i] - mean
+                # On-the-fly math yields float automatically
+                v = self.adc_view[i] - mean
                 r1 = self.ref_1f[i]
                 r2 = self.ref_2f[i]
                 acc1 += v * r1
@@ -189,7 +186,6 @@ class Lock_TimeMUX:
             
             # D. Conditional PI Execution & DAC Update
             if self.update_dac_en:
-                # Gain Scheduling & PI
                 if abs_err > self.params['thFast']:
                     self.err_int = 0.0
                     step = self.params['stepFast'] if smooth_err > 0 else -self.params['stepFast']
@@ -211,7 +207,6 @@ class Lock_TimeMUX:
                 new_code = max(min(current_code + step, 4095), 0)
                 self.ad_da.update_dac_bias(new_code)
             else:
-                # Prevent integral windup while feedback is disabled
                 self.err_int = 0.0
             
             # E. Telemetry Log

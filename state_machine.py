@@ -56,7 +56,8 @@ class StateMachine:
     def handle_usb_data(self, data: bytes):
         try:
             cmd_str = data.decode('utf-8').strip()
-            if not cmd_str: return
+            if not cmd_str: 
+                return
             self.task_queue.add_task(self._process_str_cmd, cmd_str, "usb")
         except Exception as e:
             log(INFO, "handle_usb_data error:", e)
@@ -78,13 +79,12 @@ class StateMachine:
                     self.task_queue.add_task(self._process_str_cmd, cmd_str, "uart")
                     
                     resp_data = "CMD: "+ text+'\n'
-                    if self.usb: self.usb.write(resp_data.encode('utf-8'))
+                    if self.usb: 
+                        self.usb.write(resp_data.encode('utf-8'))
                     return
                 else:
                     return
 
-            if self.usb:
-                self.usb.write(data)
 
         except Exception as e:
             log(INFO, "handle_uart_data error:", e)
@@ -214,47 +214,40 @@ class StateMachine:
                             self.task_queue.add_task(self.lock.set_update_dac, False)
                             self._write_response(f"ACK: LOCK_B UPDATE_DAC OFF\r\n", source)
                 return
+            
 
             elif head == "CALIB":
                 """
                 Command: CALIB <freq>
-                [Plan A] Automated Sequence: Dither ON -> Sample -> Dither OFF -> Calculate.
-                This ensures calibration is done with active physical perturbation.
                 """
                 freq = int(parts[1]) if len(parts) >= 2 else 800
                 if self.lock and self.ad_da:
                     log(INFO, f"Executing CALIB Plan A at {freq}Hz...")
-                    
-                    # 1. Start hardware dither output automatically
                     self.ad_da.set_lock_dither(True)
-                    pyb.delay(20) # Hardware stabilization delay
+                    pyb.delay(20) 
                     
-                    # 2. Trigger hardware-timed sampling for phase extraction (1440 points)
-                    # Note: uses self.lock.adc_buf (size 1440)
-                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_buf, timer_id=7)
+                    # [修复 BUG 1]: 适配最新内存池架构，将 adc_buf 改为 adc_view
+                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view, timer_id=7)
                     
-                    # 3. Wait for DMA transfer to finish (~75ms + safety)
                     pyb.delay(85)
-                    
-                    # 4. Stop hardware dither immediately to return to DC state
                     self.ad_da.set_lock_dither(False)
-                    
-                    # 5. Enqueue the phase calculation logic as a background task
                     self.task_queue.add_task(self.lock.calibrate_phase, freq)
                 return
 
-            elif head == "GET_PD_ADC_NOISE":
-                """
-                Command: GET_PD_ADC_NOISE [CH_NAME]
-                Captures 4320 points for raw noise evaluation.
-                """
-                self._write_response(f"GET_PD_ADC_NOISE1\r\n", source)
+            # [修复 BUG 3]: 同时兼容 GET_ADC_NOISE 和 GET_PD_ADC_NOISE
+            elif head in ["GET_ADC_NOISE", "GET_PD_ADC_NOISE"]:
                 ch_name = parts[1] if len(parts) >= 2 else "AC_Lock"
                 if self.ad_da:
-                    # Enqueue as a task to keep the state machine responsive
-                    self._write_response(f"ch_name: {ch_name}\r\n", source)
                     self.task_queue.add_task(self.ad_da.capture_noise_task, ch_name, source)
                 return
+
+            elif head == "DUMP_POOL":
+                if self.ad_da:
+                    points = int(parts[1]) if len(parts) >= 2 else 1440
+                    self.task_queue.add_task(self.ad_da.export_pool_data_task, points, source)
+                return            
+            
+
             else:
                 log(INFO, "Unknown command:", cmd_str)
             return
