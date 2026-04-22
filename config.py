@@ -7,7 +7,8 @@
 USB_READ_BUF = 128  # USB 读缓冲大小
 
 # SubBoard_ID从机ID配置
-SubBoard_ID = 1  # ID
+SubBoard_ID = 6  # ID
+Verdion = '20260422'
 
 # ID_to_loc_map = {
 #     '1': {'P_arm': 'XI', 'N_arm': 'XQ'},
@@ -112,7 +113,7 @@ SPI_PINS = {
 
 # GPIO配置字典结构：引脚名 -> [引脚号, 模式, 初始值]
 GPIO_CONFIG = {
-    "HostMode_EnVBus"   : ["A8",    "OUT",  1   ],  # 输出模式，默认高电平
+    "HostMode_EnVBus"   : ["A8",    "OUT",  0   ],  # 输出模式，默认高电平
     "USRSW"             : ["C13",   "IN",   None],  # 输入模式，无初始值
     "Pam4_MPD_Sel_Res"  : ["C5",    "OUT",  0   ],  # 输出模式，初始低电平
     "Seq_In"            : ["B8",    "OUT",  1   ],  # 输出模式，默认高电平

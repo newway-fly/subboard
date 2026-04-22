@@ -32,7 +32,7 @@ from gpio_control import GPIOControl
 
 
                          
-from config import SubBoard_ID 
+from config import SubBoard_ID, Verdion
 
 def main():
     """
@@ -52,13 +52,12 @@ def main():
     led = LedIndicator()                             # LED 指示
     usb = USBComm(task_q, handler=sm)                # USB 通信
     uart = UARTMaster(task_q, handler=sm)            # UART 通信
-    ad_da = AD_DA(task_q, handler=sm)                # ADC/DAC 控制
     gpio = GPIOControl(task_q, handler=sm)          # GPIO 控制
+    ad_da = AD_DA(task_q, handler=sm)                # ADC/DAC 控制
 
     # 创建 Sweep 扫描模块，注入任务队列、状态机和 AD_DA 对象
     sweep = Sweep(task_queue=task_q, ad_da=ad_da, gpio = gpio, handler=sm)
-    # lock = Lock_TimeMUX(task_queue=task_q, ad_da=ad_da, handler=sm, uart=uart)
-    lock = Lock_TimeMUX(ad_da=ad_da, uart_master=uart)
+    lock = Lock_TimeMUX(ad_da=ad_da, uart_master=uart, handler=sm)
 
     # 模块回注到状态机，状态机可统一调度
     # This allows the StateMachine to call into modules and coordinate
@@ -75,13 +74,11 @@ def main():
 
     # 打印系统启动日志
     log(INFO, "==============================")
+    log(INFO, "SubBoard Version Update: "+str(Verdion))
     log(INFO, "SubBoard system started for S"+str(SubBoard_ID))
+    
     log(INFO, f"MEMORY AFTER BOOTING: {gc.mem_free()}")
     log(INFO, "==============================")
-    
-    # micropython.mem_info(1)
-
-    gc.collect()
 
     # 主循环：poll 外设 -> 执行任务队列
     while True:

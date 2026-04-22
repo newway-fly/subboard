@@ -9,6 +9,8 @@
 # --------------------------------------------------
 
 import pyb
+import gc
+import machine
 from log_system import log, INFO, WARN, DEBUG, ERROR
 from config import SubBoard_ID, uart_delay_ms  # 从机 ID 配置&简单延时
 
@@ -85,7 +87,6 @@ class StateMachine:
                 else:
                     return
 
-
         except Exception as e:
             log(INFO, "handle_uart_data error:", e)
 
@@ -99,7 +100,6 @@ class StateMachine:
             if not parts: return
             head = parts[0].upper()
             
-
             # ========== ADC ==========
             if head == "ADC" and self.ad_da:
                 if len(parts) >= 2:
@@ -126,12 +126,10 @@ class StateMachine:
 
             # ========== GPIO ==========
             elif head == "GPIO" and self.gpio:
-
                 if len(parts) >= 3:
                     self.task_queue.add_task(self.gpio.set_pin_task, parts[1], parts[2].upper(), source)
                 elif len(parts) == 2:
                     self.task_queue.add_task(self.gpio.read_pin_task, parts[1], source)
-
                 elif len(parts) == 1:
                     self.task_queue.add_task(self.gpio.read_all_pins_task, source)
                 return
@@ -155,11 +153,9 @@ class StateMachine:
                 return
 
             # ========== MODE B SUBBOARD LOCKING PROTOCOL ==========
-            
             elif head == "INIT_ARM":
                 """
                 Command: INIT_ARM <MODE> [V1] [V2]
-                Example: INIT_ARM PN 1.0 5.0
                 """
                 if len(parts) >= 2 and self.ad_da:
                     mode = parts[1].upper()
@@ -172,7 +168,6 @@ class StateMachine:
             elif head == "INIT_DITHER":
                 """
                 Command: INIT_DITHER <AMP_mV>
-                Example: INIT_DITHER 30 (Sets Vpp to 30mV)
                 """
                 if len(parts) >= 2 and self.ad_da:
                     amp_mv = int(parts[1])
@@ -182,8 +177,7 @@ class StateMachine:
 
             elif head == "LOCK_B":
                 """
-                Command: LOCK_B START <TGT> <ITERS> | LOCK_B STOP | LOCK_B AMP <AMP_mV> | LOCK_B UPDATE_DAC <ON/OFF>
-                Example: LOCK_B UPDATE_DAC OFF
+                Command: LOCK_B START <TGT> <ITERS> | LOCK_B STOP | LOCK_B AMP <AMP_mV> | LOCK_B UPDATE_DAC <ON/OFF> | LOCK_B SETTLE <ms>
                 """
                 if len(parts) >= 2 and self.lock:
                     sub_cmd = parts[1].upper()
@@ -193,18 +187,16 @@ class StateMachine:
                         target = tgt_map.get(parts[2].upper(), 1)
                         iters = int(parts[3]) if len(parts) > 3 else 100
                         self.task_queue.add_task(self.lock.start_lock, target, iters)
-                        self._write_response(f"ACK: LOCK_B START TGT={parts[2]}\r\n", source)
+                        # self._write_response(f"ACK: LOCK_B START TGT={parts[2]}\r\n", source)
                         
                     elif sub_cmd == "STOP":
                         self.task_queue.add_task(self.lock.stop_lock)
                         
                     elif sub_cmd == "AMP" and len(parts) >= 3:
                         new_amp_mv = int(parts[2])
-                        # Dynamically update the in-memory sine buffer without stopping hardware
                         self.task_queue.add_task(self.ad_da.init_dither, new_amp_mv)
                         self._write_response(f"ACK: LOCK_B AMP = {new_amp_mv}mV\r\n", source)
                         
-                    # [NEW] UPDATE_DAC Command Handling
                     elif sub_cmd == "UPDATE_DAC" and len(parts) >= 3:
                         en_str = parts[2].upper()
                         if en_str == "ON":
@@ -213,29 +205,35 @@ class StateMachine:
                         elif en_str == "OFF":
                             self.task_queue.add_task(self.lock.set_update_dac, False)
                             self._write_response(f"ACK: LOCK_B UPDATE_DAC OFF\r\n", source)
+                            
+                    # [NEW] Settle Time Command
+                    elif sub_cmd == "SETTLE" and len(parts) >= 3:
+                        settle_ms = int(parts[2])
+                        self.task_queue.add_task(self.lock.set_settle_time, settle_ms)
+                        self._write_response(f"ACK: LOCK_B SETTLE = {settle_ms}ms\r\n", source)
                 return
-            
 
             elif head == "CALIB":
-                """
-                Command: CALIB <freq>
-                """
                 freq = int(parts[1]) if len(parts) >= 2 else 800
                 if self.lock and self.ad_da:
-                    log(INFO, f"Executing CALIB Plan A at {freq}Hz...")
-                    self.ad_da.set_lock_dither(True)
-                    pyb.delay(20) 
+                    log(INFO, f"Executing CALIB Plan B at {freq}Hz...")
                     
-                    # [修复 BUG 1]: 适配最新内存池架构，将 adc_buf 改为 adc_view
-                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view, timer_id=7)
+                    # self.ad_da.start_dma_engine_once()
+                    # 1. 布置正弦波，重置指针，但【不开枪】！冻结状态！
+                    self.ad_da.set_lock_dither(True, restart_timer=False)
                     
-                    pyb.delay(85)
-                    self.ad_da.set_lock_dither(False)
+                    # 2. 阻塞抓取。底层会用 1ms 中断自动【扣动发令枪】
+                    # self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view_total)
+                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view)
+                    pyb.udelay(125)#凑齐一个周期
+                    # 3. 瞬间布置直流 DC，并【立刻开枪】刷新管脚 (完美软静音)
+                    self.ad_da.set_lock_dither(False, restart_timer=True)
+                    
                     self.task_queue.add_task(self.lock.calibrate_phase, freq)
                 return
 
-            # [修复 BUG 3]: 同时兼容 GET_ADC_NOISE 和 GET_PD_ADC_NOISE
-            elif head in ["GET_ADC_NOISE", "GET_PD_ADC_NOISE"]:
+
+            elif head in ["GET_PD_ADC_NOISE"]:
                 ch_name = parts[1] if len(parts) >= 2 else "AC_Lock"
                 if self.ad_da:
                     self.task_queue.add_task(self.ad_da.capture_noise_task, ch_name, source)
@@ -247,14 +245,13 @@ class StateMachine:
                     self.task_queue.add_task(self.ad_da.export_pool_data_task, points, source)
                 return            
             
-
             else:
                 log(INFO, "Unknown command:", cmd_str)
             return
 
         except Exception as e:
             log(INFO, "_process_str_cmd error:", e)
-
+    
     # ===================================================
     # 回调输出接口
     # ===================================================
@@ -295,20 +292,16 @@ class StateMachine:
         except Exception as e: pass
 
     def handle_gpio_result(self, data, operation, source='usb'):
-        # 省略具体内容，保持原有实现
         pass
 
     def poll(self):
         """
         主循环轮询（IRQ → TaskQueue 的安全过渡点，并为 Locking 引擎供电）
         """
-        # 1. 扫描轮询 (Sweep)
         if self.sweep and self.sweep.running:
             if self.sweep._tick_flag:
                 self.sweep._tick_flag = False
                 self.task_queue.add_task(self.sweep._run_step)
 
-        # 2. 锁定引擎轮询 (Locking Engine FSM Heartbeat)
-        # 只要跑起来，就疯狂抽样，内部通过 millis 判定是否需要实质运算，纯非阻塞
         if self.lock and getattr(self.lock, 'running', False):
             self.lock.process()

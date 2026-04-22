@@ -4,13 +4,13 @@ ad_da.py
 Unified AD/DA Module with Circular DMA Dither and Arm Topology Control.
 [OPTIMIZED FOR SUBBOARD MODE B]
 - Implements a Static Memory Pool (global_adc_pool) to completely eliminate MemoryError.
-- Calculates 800Hz Sine wave array in advance without outputting.
-- Starts/Stops physical Dither only when instructed by the Locking engine.
+- [NEW] Uses a Global Shared Timer (sync_timer) for absolute phase alignment.
 """
 
 import pyb
 import math
-import gc
+import machine
+import time,gc
 from array import array
 from log_system import log, INFO
 from config import ADC_PINS, DAC_PINS, ADC_SAMPLE_TIMES, ADC_SAMPLE_DELAY_US, \
@@ -50,7 +50,6 @@ class AD_DA:
         self.dacs = {}
         self.dac_list = []
         self._dac_shadow = {}
-        
         for idx, (name, pin_name) in enumerate(DAC_PINS, start=1):
             try:
                 dac = pyb.DAC(idx, bits=12, buffering=True) 
@@ -59,254 +58,248 @@ class AD_DA:
                 dac = None
                 self._dac_shadow[name] = None
             self.dacs[name] = dac               
-            self.dac_list.append((idx, name, dac))  
+            self.dac_list.append((idx, name, dac))
+
 
         # ================= Mode B Architecture State =================
-        self.arm_mode = "P"                 # "P", "N", or "PN"
-        self.fixed_unused_dc = Bias_Arm_Volt # Fixed voltage for idle arm
-        self.bias_sum = Bias_Amp_Volt       # Total voltage for PN mode
-        self.current_main_code = 2048       # Current active DC bias code
+        self.arm_mode = "P"                 
+        self.fixed_unused_dc = Bias_Arm_Volt 
+        self.Bias_Amp_Volt = Bias_Amp_Volt       
+        self.current_main_code = 2048       
+        self.dither_amp_mv = 50             
         
-        # Dither parameters
-        self.dither_amp_mv = 30             # Amplitude in mV (Peak-to-Peak)
-        self.dither_active = False          # Physical output flag
-        self.lcm_len = 48                   # 48 points for 800Hz @ 19.2kHz
-        
-        # Pre-allocate 1D Memory Pools for Sine Generation
+        # 【路线B 核心】：DAC 数组退回单周期 48 点。DMA 会无限循环读取它。
+        self.lcm_len = 48                   
         self.sine_buf_p = array('H', [0] * self.lcm_len)
         self.sine_buf_n = array('H', [0] * self.lcm_len)
-        self.tim_dac = None
-
-        # =================================================
-        # [NEW] STATIC MEMORY POOL (The "Blackboard")
-        # Pre-allocated at boot to prevent ANY runtime fragmentation.
-        # Uses unsigned short ('H') directly mapping to 12-bit ADC data (0-4095).
-        # Size: 4320 elements (~8.6 KB). Shared between Noise Capture and Locking.
-        # =================================================
-        self.global_adc_pool = array('H', [0] * 4320)
+        
+        self.dither_active = False
+        self.dma_engine_started = False # 引擎启动标志
+        
+        self.sync_timer = pyb.Timer(6, freq=19200)
+        self.global_adc_pool = array('H', [0] * 4320)   
+        self.init_dither(self.dither_amp_mv)
 
     # =================================================
-    # [Mode B] Arm Topology & Dither Engine
+    # 初始化 bias模式
     # =================================================
     def init_arm_config(self, mode, v1=None, v2=None):
-        """
-        Configures the P/N arm relationships.
-        V1: Initial voltage for active arm. V2: Bias sum for PN mode.
-        """
         self.arm_mode = mode.upper()
-        
         if self.arm_mode in ["P", "N"]:
             v_init = v1 if v1 is not None else 1.0
             self.fixed_unused_dc = Bias_Arm_Volt
         elif self.arm_mode == "PN":
-            v_init = v1 if v1 is not None else 0.5
-            self.bias_sum = v2 if v2 is not None else Bias_Amp_Volt
-        else:
+            v_init = v1 if v1 is not None else 1.0
+            self.Bias_Amp_Volt = v2 if v2 is not None else Bias_Amp_Volt
+        else: 
             return
-
-        initial_code = int((v_init / self.vref) * 4095)
-        self.update_dac_bias(initial_code)
-        log(INFO, f"ARM Configured: {self.arm_mode}, Initial Code: {initial_code}")
+        #初始化完就启动DMA
+        self.start_dma_engine_once()
+    
+        self.update_dac_bias(int(v_init/2.0/self.vref*4096.0))
 
     def init_dither(self, amp_mv):
-        """
-        Sets the amplitude (in mV Vpp) and pre-calculates the array. 
-        Does NOT start physical output.
-        """
         self.dither_amp_mv = amp_mv
-        self._recalc_sine_buffer()
         log(INFO, f"Dither pre-calculated with Vpp: {amp_mv} mV")
 
+    def start_dma_engine_once(self):
+        """生命周期内唯一一次启动 DMA，开机即运行，永不停机"""
+        if self.dma_engine_started: 
+            return
+        
+        dac_p = self.dacs.get("DAC_Parm")
+        dac_n = self.dacs.get("DAC_Narm")
+        
+        # 启动前，先用当前 DC 填平数组
+        self.set_lock_dither(False)
+        
+        # 唯一一次强制配置 DMA
+        if dac_p: dac_p.write_timed(self.sine_buf_p, self.sync_timer, mode=pyb.DAC.CIRCULAR)
+        if dac_n: dac_n.write_timed(self.sine_buf_n, self.sync_timer, mode=pyb.DAC.CIRCULAR)
+        self.dma_engine_started = True
+
+    @micropython.native
     def _recalc_sine_buffer(self):
-        """
-        Calculates the actual output arrays based on arm mode, DC bias, and mV amplitude.
-        """
+        import math
         w = 2 * math.pi * 800 / 19200
+        # 【精准采纳你的建议】：严格锚定当前 DC 偏压
         p_base = self._dac_shadow.get("DAC_Parm", 2048)
         n_base = self._dac_shadow.get("DAC_Narm", 2048)
-        
-        # Convert Vpp (mV) to single-sided DAC code amplitude
         vref_mv = self.vref * 1000.0
-        amp_code = (self.dither_amp_mv / vref_mv) * 4095.0 / 2.0
-        
+        amp_code = (self.dither_amp_mv / vref_mv) * 4095.0 / 2.0/ 2.0 #Vpp/2/(Amp*2)
+
         for i in range(self.lcm_len):
             wave = amp_code * math.sin(w * i)
-            
             if self.arm_mode == "P":
-                val_p = int(p_base + wave)
-                val_n = n_base
+                val_p, val_n = int(p_base + wave), n_base
             elif self.arm_mode == "N":
-                val_p = p_base
-                val_n = int(n_base + wave)
+                val_p, val_n = p_base, int(n_base + wave)
             elif self.arm_mode == "PN":
-                val_p = int(p_base + wave)
-                val_n = n_base
+                val_p, val_n = int(p_base + wave/2.0), int(n_base - wave/2.0)
                 
             self.sine_buf_p[i] = max(min(val_p, 4095), 0)
             self.sine_buf_n[i] = max(min(val_n, 4095), 0)
 
-    def set_lock_dither(self, active=True):
-        """
-        Starts or Stops the circular DMA output physically.
-        """
-        dac_p = self.dacs.get("DAC_Parm")
-        dac_n = self.dacs.get("DAC_Narm")
-        
-        if active:
-            self._recalc_sine_buffer()
-            self.dither_active = True
-            if self.tim_dac is None:
-                self.tim_dac = pyb.Timer(6, freq=19200)
-            
-            if dac_p: dac_p.write_timed(self.sine_buf_p, self.tim_dac, mode=pyb.DAC.CIRCULAR)
-            if dac_n: dac_n.write_timed(self.sine_buf_n, self.tim_dac, mode=pyb.DAC.CIRCULAR)
-            log(INFO, "Hardware Dither DMA Started.")
-        else:
-            self.dither_active = False
-            if self.tim_dac:
-                self.tim_dac.deinit()
-                self.tim_dac = None
-            if dac_p: dac_p.write(self._dac_shadow.get("DAC_Parm", 2048))
-            if dac_n: dac_n.write(self._dac_shadow.get("DAC_Narm", 2048))
-            log(INFO, "Hardware Dither DMA Stopped. Restored pure DC.")
 
-    def update_dac_bias(self, new_main_code):
-        """
-        Updates the mathematical DC relationship between P and N arms.
-        Modifies memory in-place for zero-glitch tuning during locking.
-        """
-        self.current_main_code = new_main_code
-        v_main = (new_main_code / 4095.0) * self.vref
-        
-        v_p, v_n = 0.0, 0.0
-        if self.arm_mode == "P":
-            v_p, v_n = v_main, self.fixed_unused_dc
-        elif self.arm_mode == "N":
-            v_p, v_n = self.fixed_unused_dc, v_main
-        elif self.arm_mode == "PN":
-            v_p = v_main
-            v_n = max(0, self.bias_sum - v_p)
-            
-        p_code = int((v_p / self.vref) * 4095)
-        n_code = int((v_n / self.vref) * 4095)
-        
-        self._dac_shadow["DAC_Parm"] = max(min(p_code, 4095), 0)
-        self._dac_shadow["DAC_Narm"] = max(min(n_code, 4095), 0)
-        
-        if self.dither_active:
-            self._recalc_sine_buffer()
-        else:
-            if self.dacs.get("DAC_Parm"): self.dacs["DAC_Parm"].write(self._dac_shadow["DAC_Parm"])
-            if self.dacs.get("DAC_Narm"): self.dacs["DAC_Narm"].write(self._dac_shadow["DAC_Narm"])
+    def _fire_sync_timer(self, t):
+        """发令枪中断回调：瞬间拉起全局心脏 Timer6"""
+        machine.mem32[0x40001000] |= 1  # 设置 CEN = 1
+        t.deinit()                      # 开完枪即销毁
 
-    def read_adc_timed_multi(self, adc_name, buf, timer_id=7, fs=19200):
-        """
-        Hardware-timed synchronous ADC multi-read. 
-        Populates the target buffer array directly in the background via DMA/IRQ.
-        """
+    def read_adc_timed_multi(self, adc_name, view):
+
         adc = self.get_adc_object(adc_name)
         if adc:
-            try:
-                tim_adc = pyb.Timer(timer_id, freq=fs)
-                pyb.ADC.read_timed_multi((adc,), (buf,), tim_adc)
-            except Exception as e:
-                log(INFO, f"Hardware timed multi-read failed for {adc_name}:", e)
+            # 1. 设定一个 1ms 后的中断，用作延迟发令枪
+            trig = pyb.Timer(8, freq=1000)
+            trig.callback(self._fire_sync_timer)
+            
+            # 2. 阻塞调用 ADC 采样
+            # 1ms 足够底层配置完所有寄存器并进入待命。
+            # 1ms 后，中断触发，Timer6 开始跳动，DAC 和 ADC 绝对同频同相起飞！
+            adc.read_timed(view, self.sync_timer)
 
-
-
-    # =================================================
-    # [NEW] Pool Data Export: Dump Static Memory Pool
-    # =================================================
-    def export_pool_data_task(self, points, source):
+    @micropython.native
+    def set_lock_dither(self, active=True, restart_timer=True):
         """
-        启动全局内存池的导出任务
+        :param restart_timer: 布置完数组后，是否立刻启动 Timer。
+                              为 False 时用于配合 ADC 延迟发令枪使用。
         """
-        max_points = len(self.global_adc_pool)
-        points = max(1, min(points, max_points))
+        mem32 = machine.mem32
+        dac_p = self.dacs.get("DAC_Parm")
+        dac_n = self.dacs.get("DAC_Narm")
+
+        # 1. 暂停全局心脏 Timer6 (CEN = 0)
+        mem32[0x40001000] &= ~1
+        # 清零 Timer6 计数器，保证第一枪的绝对准时
+        mem32[0x40001024] = 0
         
-        if self.handler:
-            self.handler._write_response(f"Export_Sampling_DATA_START\r\n", source)
+        # 2. 暂停 DAC DMA (由于 Timer6 已停，此时物理电压死死冻结，绝不跌落)
+        if dac_p: 
+            mem32[0x40026088] &= ~1
+        if dac_n: 
+            mem32[0x400260A0] &= ~1
         
-        log(INFO, f"Starting asynchronous export of {points} points...")
+        # 死等 DMA 彻底停稳
+        if dac_p: 
+            while mem32[0x40026088] & 1: 
+                pass
+        if dac_n:
+            while mem32[0x400260A0] & 1: 
+                pass
+            
+        # 3. 在绝对安全区覆写数组
+        if active:
+            self._recalc_sine_buffer()
+        else:
+            dc_p = self._dac_shadow.get("DAC_Parm", 2048)
+            dc_n = self._dac_shadow.get("DAC_Narm", 2048)
+            for i in range(self.lcm_len):
+                self.sine_buf_p[i] = dc_p
+                self.sine_buf_n[i] = dc_n
+                
+        # 4. 终极对齐：暴力将 DMA 读指针(NDTR)拨回起跑线
+        if dac_p: 
+            mem32[0x4002608C] = self.lcm_len
+        if dac_n: 
+            mem32[0x400260A4] = self.lcm_len
         
-        # 核心：不在这里死循环！而是把任务丢给“分片发送引擎”
-        # 参数：函数名, 起始索引(0), 总点数, 数据源
-        self.task_queue.add_task(self._export_chunk_task, 0, points, source)
+        # 清除 DMA HIFCR 标志位，防止死锁
+        mem32[0x4002600C] = 0x003F0FC0
+        
+        # 5. 重新挂载 DMA (此时依然绝对安静，因为 Timer6 还停着)
+        if dac_p: 
+            mem32[0x40026088] |= 1
+        if dac_n:
+            mem32[0x400260A0] |= 1
+        
+        # 6. 根据逻辑决定是否立刻开枪
+        if restart_timer:
+            mem32[0x40001000] |= 1
+
+    def update_dac_bias(self, main_code):
+        """专门给锁定算法使用的码值直写接口，避免电压换算导致精度丢失或越界"""
+        self.current_main_code = max(min(main_code, 4095), 0)
+
+        p_code = self._dac_shadow.get("DAC_Parm", 2048)
+        n_code = self._dac_shadow.get("DAC_Narm", 2048)
+        
+        if self.arm_mode == "P":
+            p_code = self.current_main_code
+        elif self.arm_mode == "N":
+            n_code = self.current_main_code
+        elif self.arm_mode == "PN":
+            p_code = self.current_main_code
+            # PN模式下，必须保持双臂电压之和恒定，总码值为：(Bias_Amp_Volt / 2.0 / vref) * 4095
+            sum_code = int((self.Bias_Amp_Volt / 2.0 / self.vref) * 4095.0)
+            n_code = max(min(sum_code - p_code, 4095), 0)
+
+        self._dac_shadow["DAC_Parm"] = p_code
+        self._dac_shadow["DAC_Narm"] = n_code
+        
+        # 绝不调用单次 dac.write！直接瞬间刷新 DMA 正在读取的内存数组！
+        self.set_lock_dither(False)
+
+    def sync_anchor_code(self):
+        current_main_code1 = 0
+        if self.arm_mode in "P": 
+            self.current_main_code = self._dac_shadow.get("DAC_Parm", 2048)
+        elif self.arm_mode == "N":       
+            self.current_main_code = self._dac_shadow.get("DAC_Narm", 2048)
+        elif self.arm_mode == "PN":       
+            self.current_main_code = self._dac_shadow.get("DAC_Parm", 2048)
+            current_main_code1 = self._dac_shadow.get("DAC_Narm", 2048)
+        log(INFO, f"current_main_code updated:{self.current_main_code, current_main_code1}")           
 
     # =================================================
-    # [NEW] Noise Analysis: Zero-Allocation Capture
+    # Pool Data Export & Noise Capture
     # =================================================
     def capture_noise_task(self, adc_name, source):
-        """
-        DMA 采集 4320 点，采集完成后触发分片发送
-        """
-        import gc
-        gc.collect()
+        adc = self.get_adc_object(adc_name)
+        if not adc: return
         
-        try:
-            total_points = len(self.global_adc_pool) # 总是 4320
-            log(INFO, f"Triggering DMA for {total_points} points on {adc_name}...")
-            
-            # 1. 硬件 DMA 填充全局池
-            self.read_adc_timed_multi(adc_name, self.global_adc_pool, timer_id=7, fs=19200)
-            
-            # 2. 等待 DMA 搬运完毕
-            pyb.delay(250)
-            
-            if self.handler:
-                self.handler._write_response(f"NOISE_DATA_START\r\n", source)
-            
-            # 3. 核心：同样把任务丢给“分片发送引擎”
-            self.task_queue.add_task(self._export_chunk_task, 0, total_points, source)
+        buf = self.global_adc_pool
+        total_points = len(buf) 
+        
+        # 【极致优化】：抛弃所有软件原生循环！
+        # 直接让 ADC 挂载到全局的 sync_timer 上，利用底层 DMA 一口气灌满 4320 个点。
+        # 耗时精确等于 4320 / 19200 = 225 毫秒！
+        adc.read_timed(buf, self.sync_timer)
                 
-        except Exception as e:
-            log(INFO, f"ERROR in capture_noise_task: {e}")
-            if self.handler:
-                self.handler._write_response(f"ERROR: {e}\r\n", source)
+        if self.handler: 
+            self.handler._write_response(f"NOISE_DATA_START\r\n", source)
+            
+        self.task_queue.add_task(self._export_chunk_task, 0, total_points, source)
 
-    # =================================================
-    # [核心引擎] 异步分片发送器 (The Chunking Engine)
-    # =================================================
+    def export_pool_data_task(self, points, source):
+        max_points = len(self.global_adc_pool)
+        points = max(1, min(points, max_points))
+        if self.handler:
+            self.handler._write_response(f"Export_Sampling_DATA_START\r\n", source)
+        log(INFO, f"Starting asynchronous export of {points} points...")
+        self.task_queue.add_task(self._export_chunk_task, 0, points, source)
+    
     def _export_chunk_task(self, start_idx, total_points, source):
-        """
-        模仿 ADC ALL：每次只发送 20 个点。发完立刻 return 释放 CPU。
-        剩下的数据作为新任务重新塞入 TaskQueue。
-        绝对不会卡死主循环！
-        """
-        import gc
-        chunk_size = 20  # 每次发送的数量，和 ADC ALL 的体量完美一致
+        chunk_size = 20
         end_idx = min(start_idx + chunk_size, total_points)
 
         for i in range(start_idx, end_idx):
-            # 换算物理电压
             voltage = (self.global_adc_pool[i] / 4095.0) * self.vref
-            
-            # ==========================================================
-            # 【重要建议】：目前为了兼容你的 GUI，我依然只输出了纯浮点数。
-            # 但如果你发现 GUI 偶尔还是会把行拼错，强烈建议改为 ADC ALL 的格式：
-            # self.handler._write_response(f"RX: POOL {i} = {voltage:.4f}\r\n", source)
-            # ==========================================================
             if self.handler:
                 self.handler._write_response(f"{voltage:.4f}\r\n", source)
 
-        # 判断是否发完
         if end_idx < total_points:
-            # 还没发完！像接力棒一样，把下一棒塞回队列尾部
             self.task_queue.add_task(self._export_chunk_task, end_idx, total_points, source)
         else:
-            # 全部发送完毕，执行收尾
             gc.collect()
             if self.handler:
                 self.handler._write_response(f"Export_DATA_END\r\n", source)
             log(INFO, "Pool data export complete.")
 
-
-
-
     # =================================================
-    # Legacy TaskQueue Wrappers (Unchanged)
+    # Legacy Wrappers (Unchanged)
     # =================================================
-    def set_handler(self, handler):
+    def set_handler(self, handler): 
         self.handler = handler
 
     def _read_adc_avg(self, adc):
@@ -317,23 +310,19 @@ class AD_DA:
                 total += adc.read()
                 count += 1
                 pyb.udelay(self.ADC_SAMPLE_DELAY_US)
-        except Exception as e: 
-            return None
+        except Exception as e: return None
         return total // count if count else None
-
+    
     def read_all_adc_task(self, source):
         results = [(idx, name, self._read_adc_avg(adc)) for idx, name, adc in self.adc_list]
-        if self.handler: 
-            self.task_queue.add_task(self.handler.handle_adc_data, results, source)
+        if self.handler: self.task_queue.add_task(self.handler.handle_adc_data, results, source)
 
     def read_adc_task(self, ch, source):
         target = next((t for t in self.adc_list if t[0] == ch or t[1] == ch), None)
-        if not target: 
-            return
+        if not target: return
         idx, name, adc = target
         val = self._read_adc_avg(adc)
-        if self.handler: 
-            self.task_queue.add_task(self.handler.handle_adc_data, [(idx, name, val)], source)
+        if self.handler: self.task_queue.add_task(self.handler.handle_adc_data, [(idx, name, val)], source)
     
     def get_adc_object(self, ch):
         target = next((t for t in self.adc_list if t[0] == ch or t[1] == ch), None)
@@ -344,8 +333,19 @@ class AD_DA:
         for idx, name, dac in targets:
             if dac:
                 try:
-                    dac.write(value)
+                    # dac.write(value)
+                    # self._dac_shadow[name] = value
+
+                    # 1. 永远先更新影子寄存器
                     self._dac_shadow[name] = value
+                    # 2. 【核心修复】：判断该通道是否已被无缝 DMA 全局接管？
+                    if self.dma_engine_started and name in ["DAC_Parm", "DAC_Narm"]:
+                        # DMA存在则直接呼叫内存刷新，让DMA 瞬间读到新 DC 值
+                        self.set_lock_dither(False) 
+                    else:
+                        # 对于板子上未被 DMA 接管的普通低频 DAC 通道，保持正常软件写入
+                        dac.write(value)
+
                     if source and self.handler:
                         self.task_queue.add_task(self.handler.handle_dac_Set_Single, idx, name, value, source)
                 except Exception as e: pass
@@ -380,6 +380,5 @@ class AD_DA:
     def read_adc_sync(self, name, for_sweep=False):
         adc = self.adcs.get(name)
         if adc is None: return None
-        if for_sweep:
-            return self._read_adc_avg_Sweep(adc, ADC_SAMPLE_TIMES_ForSweep, ADC_SAMPLE_DELAY_US_ForSweep)
+        if for_sweep: return self._read_adc_avg_Sweep(adc, ADC_SAMPLE_TIMES_ForSweep, ADC_SAMPLE_DELAY_US_ForSweep)
         return self._read_adc_avg(adc)
