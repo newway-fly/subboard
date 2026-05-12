@@ -124,6 +124,45 @@ class StateMachine:
                     self.task_queue.add_task(self.ad_da.set_dac_task, ch, val, source)
                 return
 
+            # ========== VADC (物理电压读取) ==========
+            elif head == "VADC" and self.ad_da:
+                if len(parts) >= 2:
+                    arg = parts[1].upper()
+                    if arg == "ALL":
+                        self.task_queue.add_task(self.ad_da.read_all_vadc_task, source)
+                    else:
+                        ch = int(arg) if arg.isdigit() else arg
+                        self.task_queue.add_task(self.ad_da.read_vadc_task, ch, source)
+                return
+
+            # ========== VDAC (物理电压设置/读取) ==========
+            elif head == "VDAC" and self.ad_da:
+                if len(parts) == 2:
+                    arg = parts[1]
+                    ch = int(arg) if arg.isdigit() else arg
+                    self.task_queue.add_task(self.ad_da.read_vdac_task, ch, source)
+                elif len(parts) >= 3:
+                    arg = parts[1]
+                    ch = int(arg) if arg.isdigit() else arg
+                    val = float(parts[2])
+                    self.task_queue.add_task(self.ad_da.set_vdac_task, ch, val, source)
+                return
+
+            # ========== CALIB_RD (内存静态读取校准相位，0物理动作) ==========
+            elif head == "CALIB_RD" and self.lock:
+                if len(parts) >= 2:
+                    freq = int(parts[1])
+                    if freq == 800 or freq == 1200: # 兼容 1f
+                        self._write_response(f"CALIB_RD: 1F({freq}Hz) = {self.lock.phase_1f:.2f}\r\n", source)
+                    elif freq == 1600 or freq == 2400: # 兼容 2f
+                        self._write_response(f"CALIB_RD: 2F({freq}Hz) = {self.lock.phase_2f:.2f}\r\n", source)
+                    else:
+                        self._write_response(f"CALIB_RD: Unknown Freq {freq}\r\n", source)
+                else: # 不带参数直接打印全部
+                    self._write_response(f"CALIB_RD: 1F={self.lock.phase_1f:.2f}, 2F={self.lock.phase_2f:.2f}\r\n", source)
+                return
+
+
             # ========== GPIO ==========
             elif head == "GPIO" and self.gpio:
                 if len(parts) >= 3:
@@ -223,8 +262,8 @@ class StateMachine:
                     self.ad_da.set_lock_dither(True, restart_timer=False)
                     
                     # 2. 阻塞抓取。底层会用 1ms 中断自动【扣动发令枪】
-                    # self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view_total)
-                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view)
+                    self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view_total)
+                    # self.ad_da.read_adc_timed_multi(self.lock.adc_target_name, self.lock.adc_view)
                     pyb.udelay(125)#凑齐一个周期
                     # 3. 瞬间布置直流 DC，并【立刻开枪】刷新管脚 (完美软静音)
                     self.ad_da.set_lock_dither(False, restart_timer=True)
@@ -293,6 +332,34 @@ class StateMachine:
 
     def handle_gpio_result(self, data, operation, source='usb'):
         pass
+
+    # ---------------- 物理电压回调格式化 ----------------
+    def handle_vadc_data(self, results, source='uart'):
+        try:
+            for idx, name, val in results:
+                v_str = f"{val:.4f}V" if val is not None else "None"
+                self._write_response(f"RX: VADC {idx} {name} = {v_str}\r\n", source)
+        except Exception as e: pass
+
+    def handle_vdac_Set_Single(self, ch, name, value, source='usb'):
+        try:
+            self._write_response(f"VDAC {ch} {name} = {value:.4f}V\r\n", source)
+        except Exception as e: pass
+
+    def handle_vdac_Read_Single(self, ch, name, value, source='usb'):
+        try:
+            v_str = f"{value:.4f}V" if value is not None else "None"
+            self._write_response(f"VDAC {ch} {name} = {v_str}\r\n", source)
+        except Exception as e: pass
+
+    def handle_vdac_Read_All(self, results, source='usb'):
+        try:
+            for idx, name, val in results:
+                v_str = f"{val:.4f}V" if val is not None else "None"
+                self._write_response(f"VDAC {idx} {name} = {v_str}\r\n", source)
+        except Exception as e: pass
+
+
 
     def poll(self):
         """

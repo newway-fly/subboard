@@ -72,7 +72,8 @@ ADC_SAMPLE_TIMES = 5            #重复采样次数
 ADC_SAMPLE_DELAY_US = 2000      #采样间隔us
 ADC_SAMPLE_TIMES_ForSweep = 5
 ADC_SAMPLE_DELAY_US_ForSweep = 200#1000
-
+Divider_Down_Resistor = 150
+Divider_Up_Resistor = 200
 
 # MCU_ADDA_Vref = 3.382   #单位：V
 # PSdriver_Amp = 2 #Amplification factor of the PS driver stage

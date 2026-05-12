@@ -24,11 +24,12 @@ WARMUP_LEN = const(72)    # 3.75ms，用于吸收物理电路瞬态的“垃圾�
 TOTAL_LEN = const(1512)   # 78.75ms，DMA 实际搬运的总长度
 
 class Lock_TimeMUX:
-    def __init__(self, ad_da, uart_master, handler):
+    def __init__(self, task_queue, ad_da, uart_master, handler):
         self.ad_da = ad_da
         self.uart = uart_master
         self.running = False
         self.handler = handler
+        self.task_queue = task_queue
         
         self.adc_target_name = "AC_Lock" 
         self.BiasPoint = ['MIN','MAX','QUAD']
@@ -36,41 +37,41 @@ class Lock_TimeMUX:
 
         # 【总视图】：交给底层的 ad_da.read_adc_timed_multi 使用
         # 让 DMA 一口气搬运 1512 个点
-        # self.adc_view_total = memoryview(self.ad_da.global_adc_pool)[0:TOTAL_LEN]
+        self.adc_view_total = memoryview(self.ad_da.global_adc_pool)[0:TOTAL_LEN]
         # 【净视图】：交给 process 和 calibrate_phase 里的算法使用
         # 巧妙地切片：跳过前 72 个带有模拟电路畸变的点，只保留最后绝对稳定的 1440 个点！
-        # self.adc_view = memoryview(self.ad_da.global_adc_pool)[WARMUP_LEN:ADC_LEN]
+        self.adc_view = memoryview(self.ad_da.global_adc_pool)[WARMUP_LEN:WARMUP_LEN+ADC_LEN]
 
-        # 【净视图】：交给 process 和 calibrate_phase 里的算法使用
-        self.adc_view = memoryview(self.ad_da.global_adc_pool)[0:ADC_LEN]
+        # # 【净视图】：交给 process 和 calibrate_phase 里的算法使用
+        # self.adc_view = memoryview(self.ad_da.global_adc_pool)[0:ADC_LEN]
 
 
         self.ref_1f = array('f', [0.0] * ADC_LEN)
         self.ref_2f = array('f', [0.0] * ADC_LEN)
         
-        # Hardware calibration phase 1F=32.74,2F-147.26（已根据 180 度翻转修正 2F）
-        self.phase_1f = 124.52  
-        self.phase_2f = -141.48
+        # Hardware calibration phase （已根据 180 度翻转修正 2F）
+        self.phase_1f = 124.2
+        self.phase_2f = 38.2
 
         self.params = {
             'errLpfAlpha': 0.85, 
-            'i2Th': 0.001,       
-            'jumpErr': 0.07,     
+            'i2Th': 0.0005,       
+            'jumpErr': 0.035,     
             
-            'thFast': 0.07,      
-            'thMid': 0.01,       
+            'thFast': 0.03,      
+            'thMid': 0.005,       
             
-            'stepFast': 15,      
-            'kMid': 250.0,       
-            'kFine': 150.0,      
+            'stepFast': 55,      
+            'kMid': 800.0,       
+            'kFine': 250.0,      
             'kInt': 100.0,       # [微调1]：略微增强积分力度
             
             # [核心微调2]：放大积分限幅！
             # 允许积攒最大 0.015 的误差，0.015 * 100 = 1.0。
             # 这保证了积分器在关键时刻，绝对能爆发出 1 个码值的力量，冲破 int() 的 0 截断！
-            'intLimit': 0.015,   
+            'intLimit': 0.012,   
             'deadZone': 0.001,  # [微调3]：收紧死区，鼓励系统往极值点钻
-            'stepMax': 15        
+            'stepMax': 25        
         }
 
         self.err_int = 0.0
@@ -100,10 +101,9 @@ class Lock_TimeMUX:
     def start_lock(self, target, iters=100):
         self.target = target
         self.iters_rem = iters
-        self.err_int = 0.0
+        if self.iters_rem != 1:
+            self.err_int = 0.0
         self.last_err = 0.0
-
-        self.handler._write_response(f" LOCK_B START TGT={self.BiasPoint[self.target]}, Anchor={self.ad_da.current_main_code}\r\n", 'uart')
 
         self.ad_da.sync_anchor_code()
         self.running = True
@@ -161,8 +161,8 @@ class Lock_TimeMUX:
             self.ad_da.set_lock_dither(True, restart_timer=False)
             
             # ADC 就位，1ms 延迟中断开枪，绝对同相采样
-            # self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_view_total)
-            self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_view)
+            self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_view_total)
+            # self.ad_da.read_adc_timed_multi(self.adc_target_name, self.adc_view)
             pyb.udelay(125)
             # 切回直流，立刻开枪
             self.ad_da.set_lock_dither(False, restart_timer=True)
@@ -190,17 +190,21 @@ class Lock_TimeMUX:
             
             # C. Jump Escape Defense & Error Mapping (标准化后的 I2 逻辑)
             error_signal = 0.0
-            
+            limt_flag = True 
             if self.target == 1: # MAX 点
                 # 正常情况 I2 为负。若 I2 > i2Th，说明误入 MIN 谷底，强制输出负向逃逸信号
-                # error_signal = -self.params['jumpErr'] if i2 >= self.params['i2Th'] else i1
-                error_signal = i1
+                if i2 >= self.params['i2Th']:
+                    error_signal = -self.params['jumpErr'] 
+                    limt_flag = False
+                else:
+                    error_signal = i1
+                
                 
             elif self.target == 0: # MIN 点
                 # 正常情况 I2 为正。若 I2 < -i2Th，说明误入 MAX 山峰，强制输出正极逃逸信号
-                # error_signal = self.params['jumpErr'] if i2 <= -self.params['i2Th'] else -i1
                 if i2 <= -self.params['i2Th']:
-                    error_signal = i1
+                    error_signal = self.params['jumpErr'] 
+                    limt_flag = False
                 else:
                     error_signal = -i1
            
@@ -235,13 +239,18 @@ class Lock_TimeMUX:
                         self.err_int = -self.params['intLimit']
 
                     pi_step = int(smooth_err * self.params['kFine'] + self.err_int * self.params['kInt'])
-                    step = 0 if abs_err <= self.params['deadZone'] else pi_step
-                        
-                if step > self.params['stepMax']: 
-                    step = self.params['stepMax']
-                if step < -self.params['stepMax']: 
-                    step = -self.params['stepMax']
-                
+
+                    if abs_err <= self.params['deadZone'] and abs(self.err_int) < 0.7*self.params['intLimit']:
+                        step = 0 
+                    else: 
+                        step = pi_step
+
+                if limt_flag == True:#大步进jump可快速逼近目标点才使用
+                    if step > self.params['stepMax']: 
+                        step = self.params['stepMax']
+                    if step < -self.params['stepMax']: 
+                        step = -self.params['stepMax']
+                    
                 new_code = max(min(current_code + step, 4095), 0)
                 self.ad_da.update_dac_bias(new_code)
             else:
@@ -249,11 +258,11 @@ class Lock_TimeMUX:
                 self.err_int = 0.0
             
             self.iters_rem -= 1
-            log_str = f"LOCK: C={new_code}, I1={i1:.5f}V, I2={i2:.5f}V, Err={smooth_err:.5f}"
+            log_str = f"LOCK: C={new_code}, I1={i1:.5f}V, I2={i2:.5f}V, Err={smooth_err:.5f}, Err_inte={self.err_int:.5f}"
             if not self.update_dac_en:
                 log_str += ", UPDATE_DAC OFF"
-
-            self.handler._write_response(f" {log_str} \r\n", 'uart')
+                
+            self.task_queue.add_task(self.handler._write_response, log_str+'\r\n','uart')
             log(INFO, f"{log_str}")
 
             # =================================================

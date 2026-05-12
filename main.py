@@ -57,7 +57,7 @@ def main():
 
     # 创建 Sweep 扫描模块，注入任务队列、状态机和 AD_DA 对象
     sweep = Sweep(task_queue=task_q, ad_da=ad_da, gpio = gpio, handler=sm)
-    lock = Lock_TimeMUX(ad_da=ad_da, uart_master=uart, handler=sm)
+    lock = Lock_TimeMUX(task_queue = task_q, ad_da=ad_da, uart_master=uart, handler=sm)
 
     # 模块回注到状态机，状态机可统一调度
     # This allows the StateMachine to call into modules and coordinate

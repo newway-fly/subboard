@@ -15,7 +15,7 @@ from array import array
 from log_system import log, INFO
 from config import ADC_PINS, DAC_PINS, ADC_SAMPLE_TIMES, ADC_SAMPLE_DELAY_US, \
     ADC_SAMPLE_TIMES_ForSweep, ADC_SAMPLE_DELAY_US_ForSweep, SWeep_ADC_list, \
-    Bias_Arm_Volt, Bias_Amp_Volt, MCU_ADDA_Vref
+    Bias_Arm_Volt, Bias_Amp_Volt, MCU_ADDA_Vref, Divider_Down_Resistor, Divider_Up_Resistor
 
 class AD_DA:
     def __init__(self, task_queue, handler=None):
@@ -66,7 +66,7 @@ class AD_DA:
         self.fixed_unused_dc = Bias_Arm_Volt 
         self.Bias_Amp_Volt = Bias_Amp_Volt       
         self.current_main_code = 2048       
-        self.dither_amp_mv = 50             
+        self.dither_amp_mv = 200             
         
         # 【路线B 核心】：DAC 数组退回单周期 48 点。DMA 会无限循环读取它。
         self.lcm_len = 48                   
@@ -135,7 +135,7 @@ class AD_DA:
             elif self.arm_mode == "N":
                 val_p, val_n = p_base, int(n_base + wave)
             elif self.arm_mode == "PN":
-                val_p, val_n = int(p_base + wave/2.0), int(n_base - wave/2.0)
+                val_p, val_n = int(p_base - wave/2.0), int(n_base + wave/2.0)
                 
             self.sine_buf_p[i] = max(min(val_p, 4095), 0)
             self.sine_buf_n[i] = max(min(val_n, 4095), 0)
@@ -249,8 +249,9 @@ class AD_DA:
         elif self.arm_mode == "PN":       
             self.current_main_code = self._dac_shadow.get("DAC_Parm", 2048)
             current_main_code1 = self._dac_shadow.get("DAC_Narm", 2048)
-        log(INFO, f"current_main_code updated:{self.current_main_code, current_main_code1}")           
-
+        str = f"Bias_code updated:{self.current_main_code, current_main_code1}"    
+        self.task_queue.add_task(self.handler._write_response, str+'\r\n','uart')
+        log(INFO, str)  
     # =================================================
     # Pool Data Export & Noise Capture
     # =================================================
@@ -382,3 +383,61 @@ class AD_DA:
         if adc is None: return None
         if for_sweep: return self._read_adc_avg_Sweep(adc, ADC_SAMPLE_TIMES_ForSweep, ADC_SAMPLE_DELAY_US_ForSweep)
         return self._read_adc_avg(adc)
+
+    # =================================================
+    # 物理电压读写接口 (VADC / VDAC)
+    # =================================================
+    def read_all_vadc_task(self, source):#根据分压原理，直接转换为Parm/Narm的实际电压
+        results = []
+        for idx, name, adc in self.adc_list:
+            val = self._read_adc_avg(adc)
+            if val is not None:
+                v_val = (val / 4095.0) * self.vref/Divider_Down_Resistor*(Divider_Down_Resistor+Divider_Up_Resistor) 
+            else:
+                v_val = None
+            results.append((idx, name, v_val))
+        if self.handler: self.task_queue.add_task(self.handler.handle_vadc_data, results, source)
+
+    def read_vadc_task(self, ch, source):#根据分压原理，直接转换为Parm/Narm的实际电压
+        target = next((t for t in self.adc_list if t[0] == ch or t[1] == ch), None)
+        if not target: return
+        idx, name, adc = target
+        val = self._read_adc_avg(adc)
+        if val is not None:
+            v_val = (val / 4095.0) * self.vref/Divider_Down_Resistor*(Divider_Down_Resistor+Divider_Up_Resistor) 
+        else:
+            v_val = None
+        if self.handler: self.task_queue.add_task(self.handler.handle_vadc_data, [(idx, name, v_val)], source)
+
+    def set_vdac_task(self, ch, v_val, source):#set volt_value to DAC PIN, volt_value*2 = bias_Ampl output Volt
+        # 物理电压转原码值
+        code = int((v_val / self.vref) * 4095.0)
+        code = max(0, min(code, 4095))
+        
+        targets = self.dac_list[:] if ch == "ALL" else [t for t in self.dac_list if t[0] == ch or t[1] == ch]
+        for idx, name, dac in targets:
+            if dac:
+                try:
+                    self._dac_shadow[name] = code
+                    # 无缝 DMA 拦截判断
+                    if self.dma_engine_started and name in ["DAC_Parm", "DAC_Narm"]:
+                        self.set_lock_dither(False)
+                    else:
+                        dac.write(code)
+                        
+                    if source and self.handler:
+                        self.task_queue.add_task(self.handler.handle_vdac_Set_Single, idx, name, v_val, source)
+                except Exception as e: pass
+
+    def read_vdac_task(self, ch, source):#Read volt_value from DAC PIN, volt_value*2 = bias_Ampl output Volt
+        targets = self.dac_list[:] if ch == "ALL" else [t for t in self.dac_list if t[0] == ch or t[1] == ch]
+        results = []
+        for idx, name, _ in targets:
+            code = self._dac_shadow.get(name)
+            v_val = (code / 4095.0) * self.vref if code is not None else None
+            results.append((idx, name, v_val))
+        if self.handler:
+            if len(results) == 1:
+                self.task_queue.add_task(self.handler.handle_vdac_Read_Single, results[0][0], results[0][1], results[0][2], source)
+            else:
+                self.task_queue.add_task(self.handler.handle_vdac_Read_All, results, source)
